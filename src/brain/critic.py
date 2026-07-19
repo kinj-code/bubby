@@ -115,14 +115,17 @@ class CognitiveCritic:
     2. Utility Check → is this actually helpful?
     3. Safety Check → is the action whitelisted?
     4. Redundancy Check → haven't we just said this?
-    5. If any check fails → mutate output to safe silent default
-    6. Return validated output (original or corrected)
+    5. Groundedness Check → do RAG claims actually appear in retrieved chunks?
+    6. Provenance Policy Check → is this action source authorized for this action?
+    7. If any check fails → mutate output to safe silent default
+    8. Return validated output (original or corrected)
     """
 
     def __init__(
         self,
         action_executor: Optional[Any] = None,
         redundancy_tracker: Optional[RedundancyTracker] = None,
+        action_policy: Optional[Any] = None,
     ) -> None:
         """
         Initialize the cognitive critic.
@@ -130,17 +133,43 @@ class CognitiveCritic:
         Args:
             action_executor: SystemExecutor for whitelist validation
             redundancy_tracker: Tracker for detecting repetition
+            action_policy: Optional ActionPolicy for provenance-based action gating
         """
         self._action_executor = action_executor
         self._redundancy_tracker = redundancy_tracker or RedundancyTracker()
+        self._action_policy = action_policy
         self._total_checks = 0
         self._rejections = 0
         self._corrections = 0
+        self._groundedness_rejections = 0
         
         logger.info(
             f"CognitiveCritic initialized "
-            f"(executor={'enabled' if action_executor else 'disabled'})"
+            f"(executor={'enabled' if action_executor else 'disabled'}, "
+            f"policy={'enabled' if action_policy else 'disabled'})"
         )
+
+    def set_rag_context(self, retrieved_chunks: list, source: str = "") -> None:
+        """
+        Set the current RAG context for groundedness checking.
+        
+        Call this before review() when the LLM response was generated
+        with RAG-augmented context. The critic will verify that key claims
+        in the speech appear in the retrieved chunks.
+        
+        Args:
+            retrieved_chunks: List of text chunks from RAG retrieval
+            source: ActionSource string for provenance policy (e.g. 'rag_context')
+        """
+        self._rag_chunks = retrieved_chunks
+        self._rag_source = source
+        self._rag_active = bool(retrieved_chunks)
+
+    def clear_rag_context(self) -> None:
+        """Clear the current RAG context."""
+        self._rag_chunks = []
+        self._rag_source = ""
+        self._rag_active = False
 
     def review(self, output: Dict[str, Any]) -> CriticVerdict:
         """
@@ -171,6 +200,20 @@ class CognitiveCritic:
         if not self._check_redundancy(output):
             failures.append("redundancy: recently said or done")
             corrected["speech"] = ""
+
+        # ── GROUNDEDNESS CHECK (RAG entailment) ──
+        if getattr(self, '_rag_active', False) and output.get("speech"):
+            if not self._check_groundedness(output):
+                failures.append("groundedness: claims not found in retrieved context")
+                corrected["speech"] = ""
+                self._groundedness_rejections += 1
+
+        # ── PROVENANCE POLICY CHECK ──
+        if self._action_policy and output.get("action"):
+            if not self._check_provenance(output):
+                failures.append("provenance: action source not authorized")
+                corrected["action"] = ""
+                corrected["speech"] = ""
 
         # ── POST-VALIDATION FIXUP ──
         # If speech was cleared but action is valid, it's fine
@@ -281,17 +324,126 @@ class CognitiveCritic:
 
         return True
 
+    def _check_groundedness(self, output: Dict[str, Any]) -> bool:
+        """
+        Verify that factual claims in speech appear in retrieved RAG chunks.
+
+        Uses lightweight token-overlap + entity matching — no additional model
+        needed. This is the entailment check from the NLP audit recommendation:
+        "does the generated claim's key facts actually appear in the retrieved chunk, yes/no."
+
+        Returns False if the speech contains proper-noun claims that don't appear
+        in any retrieved chunk — a strong signal of hallucination.
+        """
+        speech = output.get("speech", "")
+        if not speech or not getattr(self, '_rag_chunks', None):
+            return True  # No RAG context → nothing to verify against
+
+        # Extract capitalized proper-noun phrases from speech (potential factual claims)
+        import re
+        claims = set()
+
+        # Pattern 1: Two-word proper nouns (e.g. "Salomon principle", "Gilford Motor")
+        for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+(?:v|&|and|or)\s+[A-Z][a-z]+)|[A-Z][a-z]+\s+[A-Z][a-z]+)\b', speech):
+            claims.add(match.group(0).lower())
+
+        # Pattern 2: Multi-word proper nouns with legal connectors (e.g. "Salomon v Salomon & Co Ltd", "Court of Appeal")
+        for match in re.finditer(r'\b([A-Z][a-z]+(?:\s+(?:[A-Z][a-z]+|v|&|and|or|of|in|the)\s+[A-Z][a-z]+)+)\b', speech):
+            claims.add(match.group(0).lower())
+
+        # Also extract numbers/percentages/dates as claim tokens
+        for match in re.finditer(r'\b(\d+(?:\.\d+)?%?|section\s+\d+|article\s+\d+)\b', speech, re.IGNORECASE):
+            claims.add(match.group(0).lower())
+
+        if not claims:
+            return True  # No extractable factual claims → pass
+
+        # Build a combined text of all retrieved chunks
+        combined_rag = " ".join(str(c) for c in self._rag_chunks).lower()
+
+        # Check each claim
+        missing = []
+        for claim in claims:
+            if claim not in combined_rag:
+                # Also try partial match (e.g., "Salomon v Salomon" vs "Salomon")
+                words = claim.split()
+                if len(words) >= 2:
+                    # Check if at least 50% of non-stopwords are present
+                    stopwords = {"v", "and", "or", "of", "in", "the", "a", "an", "to", "for"}
+                    content_words = [w for w in words if w not in stopwords]
+                    found = sum(1 for w in content_words if w in combined_rag)
+                    if found / max(len(content_words), 1) >= 0.5:
+                        continue
+                missing.append(claim)
+
+        if missing:
+            logger.warning(
+                f"Groundedness: {len(missing)}/{len(claims)} claims not found in RAG context: "
+                f"{missing[:3]}{'...' if len(missing) > 3 else ''}"
+            )
+            return False
+
+        return True
+
+    def _check_provenance(self, output: Dict[str, Any]) -> bool:
+        """
+        Check whether the action's source is authorized via the ActionPolicy.
+
+        Uses the ActionPolicy if configured. Falls back to allowing if no policy
+        is set (backward compatibility).
+        """
+        if not self._action_policy:
+            return True  # No policy configured → allow (backward compat)
+
+        action_name = output.get("action", "")
+        if not action_name:
+            return True  # No action → nothing to gate
+
+        # Determine source
+        from src.actions.policy import ActionSource
+        source_str = getattr(self, '_rag_source', '') or ''
+        try:
+            source = ActionSource(source_str) if source_str else ActionSource.UNKNOWN
+        except ValueError:
+            source = ActionSource.UNKNOWN
+
+        # Determine if action requires approval
+        requires_approval = False
+        action_category = ""
+        if self._action_executor:
+            request = self._action_executor.validate(action_name)
+            if request.is_valid and request.command:
+                requires_approval = request.command.requires_approval
+                action_category = request.command.category.value
+
+        decision = self._action_policy.check(
+            action_name=action_name,
+            source=source,
+            requires_approval=requires_approval,
+            action_category=action_category,
+        )
+
+        if not decision:
+            logger.warning(f"Provenance policy blocked action: {decision.reason}")
+            return False
+
+        return True
+
     def get_stats(self) -> Dict[str, Any]:
         """Get critic statistics."""
-        return {
+        stats = {
             "total_checks": self._total_checks,
             "rejections": self._rejections,
             "corrections": self._corrections,
+            "groundedness_rejections": self._groundedness_rejections,
             "pass_rate": (
                 (self._total_checks - self._rejections) / self._total_checks
                 if self._total_checks > 0 else 1.0
             ),
         }
+        if self._action_policy:
+            stats["policy_stats"] = self._action_policy.get_stats()
+        return stats
 
 
 # Testing helper

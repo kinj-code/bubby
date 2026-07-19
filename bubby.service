@@ -1,0 +1,52 @@
+[Unit]
+Description=Bubby AI Companion — Autonomous Daemon
+Documentation=https://github.com/kinj-code/bubby
+After=network.target graphical-session.target
+Wants=graphical-session.target
+
+[Service]
+Type=simple
+User=%u
+Environment=QT_QPA_PLATFORM=offscreen
+Environment=DISPLAY=:0
+Environment=XAUTHORITY=/home/%u/.Xauthority
+Environment=BUBBY_USE_LLM=1
+Environment=BUBBY_USE_TTS=0
+WorkingDirectory=%h/.continue/bubby
+ExecStartPre=/bin/sh -c 'mkdir -p %h/.continue/bubby/logs %h/.continue/bubby/data/knowledge'
+ExecStart=%h/.continue/bubby/.venv/bin/python3 %h/.continue/bubby/run_autonomous.py
+Restart=on-failure
+RestartSec=10
+RestartPreventExitStatus=SIGINT SIGTERM
+StartLimitIntervalSec=300
+StartLimitBurst=5
+StandardOutput=append:%h/.continue/bubby/logs/systemd_stdout.log
+StandardError=append:%h/.continue/bubby/logs/systemd_stderr.log
+SyslogIdentifier=bubby
+KillMode=mixed
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+# Resource limits
+MemoryHigh=12G
+MemoryMax=14G
+CPUQuota=400%
+
+# Security hardening
+NoNewPrivileges=yes
+PrivateTmp=yes
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.continue/bubby/logs %h/.continue/bubby/data
+ReadOnlyPaths=%h/.continue/bubby/src %h/.continue/bubby/scripts
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectControlGroups=yes
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+RestrictRealtime=yes
+RestrictNamespaces=yes
+LockPersonality=yes
+MemoryDenyWriteExecute=no
+
+[Install]
+WantedBy=default.target

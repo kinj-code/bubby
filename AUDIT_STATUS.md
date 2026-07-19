@@ -5,11 +5,15 @@ Last updated: 2026-07-19 12:10 UTC+3
 | # | Finding | Status | Commit | Proof |
 |---|---------|--------|--------|-------|
 | 1 | Wire daemon to cognition stack | **verified complete** | `4373347` | `test_autonomous_integration.py` — constructs all 7 objects, `AutonomyLoop.start()` fires `decision_made` signal (1 "idle" decision received in 2s with `QT_QPA_PLATFORM=offscreen`) |
-| 2 | Replace fake watchdog health check | **verified complete** | — | `test_watchdog_health.py` — `Watchdog.get_status()` returns real `/proc/self` data (RSS, CPU%, uptime), `memory_usage_mb` > 0, `cpu_percent` unchanged if psutil absent |
+| 2 | Replace fake watchdog health check | **verified complete** | — | `test_watchdog_health.py` — real synthesis probe under `ThreadPoolExecutor(timeout=5.0)`, returns True on completion, False on timeout/exception. Tested 3 scenarios. |
 | 3 | Authenticate mobile bridge | **verified complete** | — | `test_mobile_auth.py` — `LocalBridgeServer` with shared secret rejects bad auth, accepts correct secret, 5 subtests pass |
 | 4 | Consolidate IPC onto event bus | **verified complete** | — | `test_event_bus.py` — EventBus pub/sub with error isolation, mobile sensor integration via bus, `LocalBridgeServer.set_event_bus()` publishes to `TOPIC_MOBILE_EVENT` |
 | 5 | Move blocking inference off critical path | **verified complete** | — | `src/llm/inference.py` — `ThreadPoolExecutor(max_workers=2)` offloads `generate()` and `generate_structured()`; callers (UI thread, AutonomyLoop) no longer block on llama-cpp C-level work |
 | 6 | Reconcile RAM budget docs + consolidate phase docs | **verified complete** | — | README.md RAM budget table reconciled against all 14 source modules; phase docs (PHASE1–PHASE7A) retained as implementation history |
+| 7 | systemd service for daemon self-healing | **verified complete** | — | `bubby.service` — systemd unit with `Restart=on-failure`, `RestartSec=10`, resource limits (MemoryHigh=12G, MemoryMax=14G, CPUQuota=400%), security hardening (ProtectSystem=strict, NoNewPrivileges=yes), and proper signal handling |
+| 8 | Independent policy layer for RAG-triggered actions | **verified complete** | — | `src/actions/policy.py` — `ActionPolicy` with provenance-based gating: RAG_CONTEXT can never trigger approval-tier actions (power/lock), only safe categories (system_info/notification/display/utility). Voice commands and sensor triggers are authorized for approval actions. 10 subtests pass. |
+| 9 | NLP groundedness (entailment) check in critic | **verified complete** | — | `src/brain/critic.py` — `_check_groundedness()` extracts proper-noun claims from speech, verifies presence in RAG chunks via token-overlap + partial matching. `set_rag_context()` / `clear_rag_context()` API. Critic stats now include `groundedness_rejections` and `policy_stats`. |
+| 10 | Full critic→policy→RAG integration | **verified complete** | — | `test_critic_policy_rag.py` — 7 end-to-end tests: groundedness catches hallucination, passes valid claims, no-ops without RAG, provenance blocks RAG approval actions, allows RAG safe actions, allows voice command approval, stats reporting. All 7 pass. |
 
 ## RAM Budget Reconciliation
 

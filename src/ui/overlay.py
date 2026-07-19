@@ -3,11 +3,20 @@
 Thread-safe: all state shared with background threads is guarded by
 a threading.Lock(). Widget mutations only happen on the main Qt thread
 via Signal/slot dispatch.
+
+Features:
+- Click-through mode for non-interactive states
+- Working close button (bottom-right corner)
+- Drag-to-move (suppresses autonomy spam during drag)
+- Sprite-based frame animation with PNG sprites
+- Idle wandering via QPropertyAnimation
 """
 
 import logging
+import random
 import threading
-from typing import Optional, Tuple
+from pathlib import Path
+from typing import Dict, List, Optional, Tuple
 
 from PySide6.QtWidgets import QWidget, QApplication, QLabel
 from PySide6.QtCore import (
@@ -15,7 +24,7 @@ from PySide6.QtCore import (
     QEasingCurve, QRect,
 )
 from PySide6.QtGui import (
-    QPainter, QColor, QPen, QBrush, QCursor,
+    QPainter, QColor, QPen, QBrush, QCursor, QPixmap, QFont,
 )
 
 from src.brain.decisions import Decision, DecisionType
@@ -23,28 +32,141 @@ from src.brain.decisions import Decision, DecisionType
 logger = logging.getLogger(__name__)
 
 
+# ── Sprite animation framework ────────────────────────────────────
+
+class SpriteAnimation:
+    """
+    Frame-based sprite animation from PNG images.
+
+    Loads a sequence of PNG frames from a directory and cycles
+    through them at a configurable FPS via a QTimer.
+    """
+
+    def __init__(self, name: str, frames: List[QPixmap], fps: int = 12,
+                 loop: bool = True):
+        self.name = name
+        self.frames = frames
+        self.fps = fps
+        self.loop = loop
+        self.current_frame = 0
+        self.playing = False
+
+    def start(self) -> None:
+        self.playing = True
+        self.current_frame = 0
+
+    def stop(self) -> None:
+        self.playing = False
+
+    def current_pixmap(self) -> Optional[QPixmap]:
+        if not self.frames:
+            return None
+        idx = self.current_frame % len(self.frames)
+        return self.frames[idx]
+
+    def advance(self) -> bool:
+        """Advance to next frame. Returns True if still playing."""
+        if not self.frames:
+            self.playing = False
+            return False
+        self.current_frame += 1
+        if self.current_frame >= len(self.frames):
+            if self.loop:
+                self.current_frame = 0
+                return True
+            else:
+                self.playing = False
+                return False
+        return True
+
+
+class SpriteManager:
+    """
+    Manages multiple sprite animations loaded from disk.
+
+    Directory layout expected:
+      sprites/
+        idle/
+          00.png, 01.png, 02.png, ...
+        walk/
+          00.png, 01.png, ...
+        wave/
+          00.png, 01.png, ...
+    """
+
+    SPRITE_DIR = Path(__file__).parent.parent.parent / "sprites"
+
+    def __init__(self) -> None:
+        self._animations: Dict[str, SpriteAnimation] = {}
+        self._current: Optional[str] = None
+        self._load_all()
+
+    def _load_all(self) -> None:
+        """Load all sprite directories into animations."""
+        if not self.SPRITE_DIR.exists():
+            logger.info("No sprites/ directory found — using emoji fallback")
+            return
+
+        for anim_dir in sorted(self.SPRITE_DIR.iterdir()):
+            if not anim_dir.is_dir():
+                continue
+            name = anim_dir.name.lower()
+            frames: List[QPixmap] = []
+            for img_file in sorted(anim_dir.glob("*.png")):
+                pix = QPixmap(str(img_file))
+                if not pix.isNull():
+                    frames.append(pix)
+            if frames:
+                self._animations[name] = SpriteAnimation(
+                    name=name, frames=frames, fps=12, loop=True,
+                )
+                logger.info(f"Sprite loaded: '{name}' ({len(frames)} frames)")
+            else:
+                logger.debug(f"No PNG frames in sprites/{name}/")
+
+    def has_sprites(self) -> bool:
+        return len(self._animations) > 0
+
+    def play(self, name: str) -> Optional[SpriteAnimation]:
+        """Start playing a named animation. Returns the SpriteAnimation."""
+        if name in self._animations:
+            self._current = name
+            anim = self._animations[name]
+            anim.start()
+            return anim
+        return None
+
+    def current_animation(self) -> Optional[SpriteAnimation]:
+        if self._current:
+            return self._animations.get(self._current)
+        return None
+
+
+# ── Overlay Window ────────────────────────────────────────────────
+
 class OverlayWindow(QWidget):
     """
-    Frameless, transparent, always-on-top overlay window.
-
-    Features:
-    - Click-through mode for non-interactive states
-    - Drag-and-drop close zone detection
-    - Wayland-compatible transparency
-    - Thread-safe state access for cross-thread updates
+    Frameless, transparent, always-on-top overlay window with
+    sprite animation, close button, dragging, and idle wandering.
     """
 
-    # ── Signals (thread-safe dispatch to main thread) ──────────────
+    # ── Signals ──
     close_requested = Signal()
-    drag_started = Signal(QPoint)
-    drag_finished = Signal(QPoint)
+    drag_started_signal = Signal(QPoint)
+    drag_finished_signal = Signal(QPoint)
     click_through_changed = Signal(bool)
-    display_message_signal = Signal(str, str, str)  # text, animation, event_type
-    update_state_signal = Signal(str, str)           # state_name, message_text
-    behavior_state_signal = Signal(object)            # Decision object
+    display_message_signal = Signal(str, str, str)
+    update_state_signal = Signal(str, str)
+    behavior_state_signal = Signal(object)
+    # Signal emitted while dragging (so autonomy loop can suppress)
+    dragging_changed = Signal(bool)
 
-    CLOSE_ZONE_SIZE = 80
-    CLOSE_ZONE_COLOR = QColor(255, 59, 48, 180)
+    CLOSE_ZONE_SIZE = 50
+    CLOSE_ZONE_COLOR = QColor(255, 59, 48, 160)
+
+    # Wandering
+    WANDER_INTERVAL_MS = 8_000   # Wander every 8 seconds when idle
+    WANDER_DURATION_MS = 3_500   # Movement takes 3.5 seconds
 
     def __init__(
         self,
@@ -63,12 +185,28 @@ class OverlayWindow(QWidget):
         self._animation_widget: Optional[QWidget] = None
         self._state_label: Optional[QLabel] = None
         self._current_tint: Optional[QColor] = None
-
-        # Thread-safety lock for state shared with background threads
         self._state_lock = threading.Lock()
+
+        # Sprite animation
+        self._sprite_manager = SpriteManager()
+        self._sprite_timer = QTimer(self)
+        self._sprite_timer.timeout.connect(self._advance_sprite)
+        self._current_anim: Optional[SpriteAnimation] = None
+        self._current_anim_name = "idle"
+
+        # Emoji fallback
+        self._emoji_label: Optional[QLabel] = None
+
+        # Idle wandering timer
+        self._wander_timer = QTimer(self)
+        self._wander_timer.timeout.connect(self._idle_wander)
+        self._wander_timer.start(self.WANDER_INTERVAL_MS)
 
         self._setup_window()
         self._setup_close_zone_timer()
+
+        # Start default animation
+        self.set_state("idle")
         logger.info(f"OverlayWindow initialized: {size}")
 
     # ── Window setup ──────────────────────────────────────────────
@@ -89,9 +227,56 @@ class OverlayWindow(QWidget):
     def _setup_close_zone_timer(self) -> None:
         self._close_zone_timer = QTimer(self)
         self._close_zone_timer.timeout.connect(self._update_close_zone)
-        self._close_zone_timer.start(16)  # ~60 FPS
+        self._close_zone_timer.start(16)
 
     # ── Public API ────────────────────────────────────────────────
+
+    def set_state(self, state_name: str, message_text: str = "") -> None:
+        """
+        Set the visual animation state.
+
+        Args:
+            state_name: One of 'idle', 'wave', 'talk', 'observe',
+                        'think', 'confused', 'curious', 'success'.
+            message_text: Optional message to display.
+        """
+        self._current_anim_name = state_name
+
+        # Try sprite first
+        if self._sprite_manager.has_sprites():
+            anim = self._sprite_manager.play(state_name)
+            if anim:
+                if not self._sprite_timer.isActive():
+                    self._sprite_timer.start(1000 // max(anim.fps, 1))
+                self._current_anim = anim
+                if self._emoji_label:
+                    self._emoji_label.hide()
+                self.update()
+                return
+
+        # Emoji fallback
+        self._sprite_timer.stop()
+        self._current_anim = None
+        emote_map = {
+            "idle": "\U0001F600", "wave": "\U0001F44B", "talk": "\U0001F4AC",
+            "observe": "\U0001F440", "think": "\U0001F914",
+            "confused": "\U0001F615", "curious": "\U0001F9D0",
+            "success": "\u2705", "frustrated": "\U0001F624",
+        }
+        emoji = emote_map.get(state_name, "\U0001F600")
+        if not self._emoji_label:
+            self._emoji_label = QLabel(self)
+            font = QFont()
+            font.setPointSize(64)
+            self._emoji_label.setFont(font)
+            self._emoji_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            self._emoji_label.setStyleSheet("background: transparent;")
+            self._emoji_label.setGeometry(0, 0, *self._window_size)
+        self._emoji_label.setText(emoji)
+        self._emoji_label.show()
+
+        if message_text:
+            self._update_state_text(message_text)
 
     def set_click_through(self, enabled: bool) -> None:
         self._click_through = enabled
@@ -116,8 +301,7 @@ class OverlayWindow(QWidget):
     ) -> None:
         if not text:
             return
-        display_text = text[:100]
-        self._update_state_text(display_text)
+        self._update_state_text(text[:100])
         event_tints = {
             "greeting": QColor(255, 200, 200, 60),
             "observation": QColor(200, 180, 255, 60),
@@ -133,34 +317,18 @@ class OverlayWindow(QWidget):
         QTimer.singleShot(duration_ms, self._clear_message)
 
     def update_behavior_state(self, decision: Decision) -> None:
-        logger.info(f"Behavior state update: {decision.decision_type.value}")
+        logger.debug(f"Behavior state: {decision.decision_type.value}")
         if decision.decision_type == DecisionType.WANDER:
-            target_x = decision.params.get("target_x", 0)
-            target_y = decision.params.get("target_y", 0)
-            self.wander_to(QPoint(int(target_x), int(target_y)))
-        state_text = decision.decision_type.value.upper()
-        self._update_state_text(state_text)
+            self._idle_wander()
         self._update_state_tint(decision.decision_type)
 
-    def wander_to(self, target: QPoint) -> None:
-        safe = self._get_safe_bounds()
-        cx = max(safe.left(), min(target.x(), safe.right() - self._window_size[0]))
-        cy = max(safe.top(), min(target.y(), safe.bottom() - self._window_size[1]))
-        clamped = QPoint(cx, cy)
-        if self.pos() == clamped:
-            return
-        logger.info(f"Wandering to: ({cx}, {cy})")
-        anim = QPropertyAnimation(self, b"pos")
-        anim.setDuration(2000)
-        anim.setStartValue(self.pos())
-        anim.setEndValue(clamped)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        anim.start()
+    def is_dragging(self) -> bool:
+        return self._is_dragging
 
     def sizeHint(self) -> QSize:
         return QSize(*self._window_size)
 
-    # ── Internal helpers ──────────────────────────────────────────
+    # ── Close button ──────────────────────────────────────────────
 
     def _is_in_close_zone(self, pos: QPoint) -> bool:
         if not self._close_zone_enabled:
@@ -172,8 +340,7 @@ class OverlayWindow(QWidget):
         if not self._close_zone_enabled or self._click_through:
             self.update()
             return
-        mouse_pos = self.mapFromGlobal(QCursor.pos())
-        if self._is_in_close_zone(mouse_pos):
+        if self._is_in_close_zone(self.mapFromGlobal(QCursor.pos())):
             self.update()
 
     def _clear_message(self) -> None:
@@ -183,25 +350,55 @@ class OverlayWindow(QWidget):
             self._current_tint = None
         self.update()
 
+    # ── Idle wandering ────────────────────────────────────────────
+
+    def _idle_wander(self) -> None:
+        """Move window to a random position on screen."""
+        if self._is_dragging:
+            return
+        bounds = self._get_safe_bounds()
+        tx = random.randint(bounds.left(), max(bounds.left() + 1, bounds.right()))
+        ty = random.randint(bounds.top(), max(bounds.top() + 1, bounds.bottom()))
+        target = QPoint(tx, ty)
+        if target == self.pos():
+            return
+
+        logger.debug(f"Idle wander to ({tx}, {ty})")
+        anim = QPropertyAnimation(self, b"pos")
+        anim.setDuration(self.WANDER_DURATION_MS)
+        anim.setStartValue(self.pos())
+        anim.setEndValue(target)
+        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        anim.start()
+
+    def wander_to(self, target: QPoint) -> None:
+        """Public entry point for explicit wander_to calls."""
+        self._idle_wander()
+
+    # ── State display helpers ─────────────────────────────────────
+
     def _update_state_text(self, text: str) -> None:
         if not hasattr(self, '_state_label') or self._state_label is None:
             self._state_label = QLabel(self)
             self._state_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
             self._state_label.setStyleSheet("""
                 QLabel {
-                    color: rgba(255, 255, 255, 200);
-                    font-size: 24px;
+                    color: rgba(255, 255, 255, 220);
+                    font-size: 14px;
                     font-weight: bold;
-                    background: rgba(0, 0, 0, 50);
-                    border-radius: 10px;
-                    padding: 10px;
+                    background: rgba(0, 0, 0, 80);
+                    border-radius: 8px;
+                    padding: 6px 12px;
                 }
             """)
-            self._state_label.setGeometry(50, 50, self._window_size[0] - 100, 100)
+            self._state_label.setGeometry(
+                20, self._window_size[1] - 60,
+                self._window_size[0] - 40, 40,
+            )
         self._state_label.setText(text)
         self._state_label.show()
 
-    def _update_state_tint(self, decision_type: DecisionType) -> None:
+    def _update_state_tint(self, decision_type):
         colors = {
             DecisionType.IDLE: None,
             DecisionType.WANDER: QColor(173, 216, 230, 30),
@@ -221,73 +418,89 @@ class OverlayWindow(QWidget):
         if not screen:
             return QRect(0, 0, 1920, 1080)
         r = screen.availableGeometry()
-        margin = 100
+        m = 100
         return QRect(
-            r.left() + margin,
-            r.top() + margin,
-            r.width() - margin * 2 - self._window_size[0],
-            r.height() - margin * 2 - self._window_size[1],
+            r.left() + m, r.top() + m,
+            r.width() - m * 2 - self._window_size[0],
+            r.height() - m * 2 - self._window_size[1],
         )
 
-    # ── Qt event overrides ────────────────────────────────────────
+    # ── Sprite animation ──────────────────────────────────────────
+
+    def _advance_sprite(self) -> None:
+        if self._current_anim:
+            if not self._current_anim.advance():
+                self._sprite_timer.stop()
+            self.update()
+
+    # ── Qt events ─────────────────────────────────────────────────
 
     def paintEvent(self, event) -> None:  # noqa: ARG002
-        """Paint close zone indicator and state tint (thread-safe)."""
         try:
-            # ── State tint ──
+            # State tint
             with self._state_lock:
                 tint = self._current_tint
             if tint is not None:
                 p = QPainter(self)
                 p.setRenderHint(QPainter.RenderHint.Antialiasing)
                 p.fillRect(self.rect(), tint)
-                # Important: end the painter before using another one below
                 p.end()
 
-            # ── Close zone ──
+            # Sprite frame
+            if self._current_anim and self._current_anim.playing:
+                pix = self._current_anim.current_pixmap()
+                if pix and not pix.isNull():
+                    p = QPainter(self)
+                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                    # Center the sprite in the window, scaled to fit
+                    scaled = pix.scaled(
+                        self._window_size[0], self._window_size[1],
+                        Qt.AspectRatioMode.KeepAspectRatio,
+                        Qt.TransformationMode.SmoothTransformation,
+                    )
+                    x = (self._window_size[0] - scaled.width()) // 2
+                    y = (self._window_size[1] - scaled.height()) // 2
+                    p.drawPixmap(x, y, scaled)
+                    p.end()
+
+            # Close zone
             if not self._close_zone_enabled or self._click_through:
                 return
-
-            # Guard: window dimensions must be valid
-            w = self.width()
-            h = self.height()
+            w, h = self.width(), self.height()
             if w <= 0 or h <= 0:
                 return
-
             mouse_pos = self.mapFromGlobal(QCursor.pos())
             if not self._is_in_close_zone(mouse_pos):
                 return
 
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-
-            center = QPoint(w - self.CLOSE_ZONE_SIZE // 2, h - self.CLOSE_ZONE_SIZE // 2)
-            radius = self.CLOSE_ZONE_SIZE // 2
-
+            cx = w - self.CLOSE_ZONE_SIZE // 2
+            cy = h - self.CLOSE_ZONE_SIZE // 2
+            r = self.CLOSE_ZONE_SIZE // 2
             p.setPen(Qt.PenStyle.NoPen)
             p.setBrush(QBrush(self.CLOSE_ZONE_COLOR))
-            p.drawEllipse(center, radius, radius)
-
+            p.drawEllipse(QPoint(cx, cy), r, r)
             pen = QPen(QColor(255, 255, 255, 255), 3)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
-
-            offset = radius // 3
-            p.drawLine(
-                center.x() - offset, center.y() - offset,
-                center.x() + offset, center.y() + offset,
-            )
-            p.drawLine(
-                center.x() + offset, center.y() - offset,
-                center.x() - offset, center.y() + offset,
-            )
+            off = r // 3
+            p.drawLine(cx - off, cy - off, cx + off, cy + off)
+            p.drawLine(cx + off, cy - off, cx - off, cy + off)
             p.end()
         except Exception as e:
-            logger.debug(f"paintEvent suppressed: {e}")
+            logger.debug(f"paintEvent: {e}")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
-            self._drag_start_pos = event.pos()
+            pos = event.pos()
+            # Check close button first
+            if self._is_in_close_zone(pos) and self._close_zone_enabled:
+                logger.info("Close button clicked — shutting down")
+                self.close()
+                QApplication.quit()
+                return
+            self._drag_start_pos = pos
             self._is_dragging = False
         super().mousePressEvent(event)
 
@@ -295,7 +508,8 @@ class OverlayWindow(QWidget):
         if self._drag_start_pos and not self._is_dragging:
             if (event.pos() - self._drag_start_pos).manhattanLength() > self._drag_threshold:
                 self._is_dragging = True
-                self.drag_started.emit(event.pos())
+                self.dragging_changed.emit(True)
+                self.drag_started_signal.emit(event.pos())
         if self._is_dragging:
             self.move(event.globalPosition().toPoint() - self._drag_start_pos)
         super().mouseMoveEvent(event)
@@ -303,12 +517,10 @@ class OverlayWindow(QWidget):
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             if self._is_dragging:
-                if self._is_in_close_zone(event.pos()):
-                    self.close_requested.emit()
-                else:
-                    self.drag_finished.emit(event.pos())
+                self.drag_finished_signal.emit(event.pos())
                 self._is_dragging = False
                 self._drag_start_pos = None
+                self.dragging_changed.emit(False)
         super().mouseReleaseEvent(event)
 
     def enterEvent(self, event) -> None:
@@ -322,6 +534,9 @@ class OverlayWindow(QWidget):
         super().leaveEvent(event)
 
     def closeEvent(self, event) -> None:
+        logger.info("OverlayWindow closing")
+        self._sprite_timer.stop()
+        self._wander_timer.stop()
         if self._animation_widget:
             self._animation_widget.setParent(None)
         super().closeEvent(event)
@@ -331,12 +546,8 @@ class OverlayWindow(QWidget):
 
 if __name__ == "__main__":
     import sys
-    logging.basicConfig(
-        level=logging.DEBUG,
-        format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
-    )
+    logging.basicConfig(level=logging.DEBUG, format="%(asctime)s - %(message)s")
     app = QApplication(sys.argv)
-    window = OverlayWindow(size=(400, 400), click_through=False)
-    window.close_requested.connect(lambda: logger.info("CLOSE REQUESTED"))
+    window = OverlayWindow(size=(400, 400))
     window.show()
     sys.exit(app.exec())

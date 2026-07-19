@@ -156,11 +156,19 @@ class ModelManager:
         self._downloaded_models: Dict[str, Dict[str, Any]] = self._load_cache()
         
         # Check for user-specified local model path
-        self._local_llm_path = os.environ.get("BUBBY_LLM_PATH", "").strip()
-        if self._local_llm_path:
-            local_path = Path(self._local_llm_path)
-            logger.info(f"BUBBY_LLM_PATH env var is set to: {local_path}")
-            if local_path.exists():
+        raw_path = os.environ.get("BUBBY_LLM_PATH", "").strip()
+        if raw_path:
+            # Resolve relative paths against the project root
+            local_path = Path(raw_path)
+            if not local_path.is_absolute():
+                project_root = Path(__file__).parent.parent.parent
+                local_path = (project_root / local_path).resolve()
+            else:
+                local_path = local_path.resolve()
+            self._local_llm_path = str(local_path)
+            logger.info(f"BUBBY_LLM_PATH env var: raw='{raw_path}', resolved='{local_path}'")
+            logger.info(f"  exists={local_path.exists()}, is_file={local_path.is_file()}")
+            if local_path.exists() and local_path.is_file():
                 logger.info(f"Loading local LLM from {local_path}")
             else:
                 logger.warning(
@@ -169,6 +177,7 @@ class ModelManager:
                     f"or set BUBBY_LLM_PATH to point to an existing .gguf file."
                 )
         else:
+            self._local_llm_path = ""
             logger.info("BUBBY_LLM_PATH not set — will auto-select from catalog if a model is downloaded")
         
         logger.info(f"ModelManager initialized (dir: {self._models_dir})")

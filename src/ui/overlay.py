@@ -511,7 +511,8 @@ class OverlayWindow(QWidget):
         if self._current_anim:
             if not self._current_anim.advance():
                 self._sprite_timer.stop()
-            self.update()
+        self.update()
+        # Always refresh window mask on every frame
         self._update_mask()
 
     def _update_mask(self) -> None:
@@ -520,10 +521,13 @@ class OverlayWindow(QWidget):
         Cuts the window to the shape of the character's visible pixels
         plus the input box area. Eliminates the blue background box entirely.
         """
-        from PySide6.QtGui import QBitmap, QImage
+        from PySide6.QtGui import QBitmap
         w, h = self.width(), self.height()
         if w <= 0 or h <= 0:
             return
+
+        # Always clear the old mask before computing new one
+        self.clearMask()
 
         mask = QBitmap(w, h)
         mask.fill(Qt.GlobalColor.color0)
@@ -531,7 +535,7 @@ class OverlayWindow(QWidget):
         p = QPainter(mask)
         p.setRenderHint(QPainter.RenderHint.Antialiasing)
 
-        # Include sprite pixels
+        # Include sprite pixels from CURRENT frame
         if self._current_anim and self._current_anim.playing:
             pix = self._current_anim.current_pixmap()
             if pix and not pix.isNull():
@@ -542,7 +546,6 @@ class OverlayWindow(QWidget):
                 )
                 x = (w - scaled.width()) // 2
                 y = (h - scaled.height()) // 2
-                # Convert to mask: transparent stays 0 (invisible), opaque → 1
                 sprite_mask = scaled.createMaskFromColor(
                     QColor(0, 0, 0, 0), Qt.MaskMode.MaskOutColor
                 )
@@ -551,7 +554,6 @@ class OverlayWindow(QWidget):
         # Always include input box area so user can type
         if hasattr(self, '_input_box') and self._input_box.isVisible():
             input_rect = self._input_box.geometry()
-            # Expand slightly so the border is included
             input_rect = input_rect.adjusted(-2, -2, 2, 4)
             p.fillRect(input_rect, Qt.GlobalColor.color1)
 
@@ -572,10 +574,10 @@ class OverlayWindow(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: ARG002
         try:
-            # IMPORTANT: Do NOT fill the entire rect with a solid color.
-            # The background must remain 100% transparent on X11/Linux.
-            # Only draw specific overlays (sprite, close button) on top
-            # of the transparent background.
+            # IMPORTANT: Use CompositionMode_Source to clear the background
+            # before painting. This ensures transparency works on X11/Linux.
+            # The window mask (setMask) cuts the window shape; here we ensure
+            # no background fill is painted.
 
             # State tint — only draw if explicitly set (event-specific highlight)
             with self._state_lock:
@@ -587,12 +589,13 @@ class OverlayWindow(QWidget):
                 p.fillRect(self.rect(), tint)
                 p.end()
 
-            # Sprite frame
+            # Sprite frame — paint with CompositionMode_Source to clear background
             if self._current_anim and self._current_anim.playing:
                 pix = self._current_anim.current_pixmap()
                 if pix and not pix.isNull():
                     p = QPainter(self)
                     p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
                     # Center the sprite in the window, scaled to fit
                     scaled = pix.scaled(
                         self._window_size[0], self._window_size[1],

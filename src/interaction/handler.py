@@ -297,13 +297,26 @@ class InteractionHandler:
             response_dict = verdict.corrected_output
             self._critic.clear_rag_context()
 
+        # If LLM is not available, provide a helpful error message
+        speech = response_dict.get("speech", "")
+        if not speech or speech in ("", None):
+            llm_stats = self._engine.get_stats() if self._engine else {}
+            if not llm_stats.get("llm_available", False):
+                speech = (
+                    "LLM not loaded. Please check BUBBY_LLM_PATH in your .env file "
+                    "or run scripts/download_llm.py to download a model."
+                )
+            else:
+                speech = "I'm not sure what to say. Let me think about that..."
+
         message = InteractionMessage(
-            text=response_dict.get("speech", ""),
+            text=speech,
             event=InteractionEvent.RESPONSE,
             animation="wave",
             source="synthesis"
         )
 
+        # _add_message dispatches via _display_callback automatically
         self._add_message(message)
         return message
     

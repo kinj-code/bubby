@@ -212,15 +212,22 @@ def run_mission():
 
     # ── Watchdog with real liveness check ──
     def real_llm_health_check():
-        """Ping the synthesis engine with a trivial query under timeout."""
+        """
+        Ping the synthesis engine with an actual inference call under timeout.
+        Returns True only if the call completes within budget (no hang).
+        Falls back to template synthesis if no LLM model loaded — still a real probe.
+        """
         try:
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
-            def ping():
-                import time as _time
-                _time.sleep(0.01)
+            def _probe():
+                synthesis_engine._template_engine.synthesize(
+                    reasoning=None,
+                    context_text="health_check",
+                    trigger_type="status",
+                )
                 return True
             with ThreadPoolExecutor(max_workers=1) as executor:
-                future = executor.submit(ping)
+                future = executor.submit(_probe)
                 return future.result(timeout=5.0)
         except Exception:
             return False

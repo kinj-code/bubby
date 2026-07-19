@@ -8,6 +8,10 @@ description = "Rust core kernel for Bubby — deterministic memory, vector searc
 name = "bubby_core"
 crate-type = ["cdylib", "rlib"]
 
+[[bin]]
+name = "bubby-core"
+path = "src/main.rs"
+
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled-sqlcipher", "vtab"] }
 serde = { version = "1", features = ["derive"] }

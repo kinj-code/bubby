@@ -303,14 +303,15 @@ class LLMSynthesisEngine:
     ) -> str:
         """Build a simple conversational system prompt (no JSON schema)."""
         name = self._persona.name
-        style = self._persona.style_tagline
-        personality = getattr(self._persona, 'personality', 'friendly and helpful')
+        backstory = self._persona.backstory.replace('\n', ' ').strip()
+        traits_str = self._persona.traits.to_prompt_segment() if self._persona.traits else "friendly and helpful"
         
         return (
-            f"You are {name}, a cute desktop companion slime. {style}\n"
-            f"Personality: {personality}\n"
+            f"{backstory}\n"
+            f"Personality traits: {traits_str}\n"
             f"Be brief, warm, and conversational. Use 1-2 sentences max.\n"
-            f"Never mention you are an AI. Stay in character."
+            f"Never mention you are an AI, your internal state, or your decision logic.\n"
+            f"Stay in character as {name} at all times."
         )
 
     def _generate_llm_response(

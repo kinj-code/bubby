@@ -178,8 +178,9 @@ class AutonomyLoop(QThread):
         """
         Perform vision check with Smart Sampling.
         
-        Args:
-            context: Current screen context (will be updated)
+        Uses reasoning confidence to adjust vision mode (idle/normal/alert),
+        replacing the frame-based change detector with confidence-based
+        sampling rate control.
         """
         try:
             logger.debug(f"Performing vision check (mode={self._current_vision_mode})")
@@ -192,8 +193,22 @@ class AutonomyLoop(QThread):
                 context.content_type = reasoning.content_type
                 context.content_confidence = reasoning.confidence
                 
+                # ── Smart Sampling: adjust mode based on confidence ──
+                if reasoning.confidence >= 0.7:
+                    if self._current_vision_mode != "alert":
+                        logger.debug(f"Vision mode: {self._current_vision_mode} → alert (high confidence)")
+                        self._current_vision_mode = "alert"
+                elif reasoning.confidence >= 0.4:
+                    if self._current_vision_mode == "alert":
+                        logger.debug(f"Vision mode: alert → normal")
+                        self._current_vision_mode = "normal"
+                else:
+                    if self._current_vision_mode != "idle":
+                        logger.debug(f"Vision mode: {self._current_vision_mode} → idle (low confidence)")
+                        self._current_vision_mode = "idle"
+                
                 logger.debug(f"Vision check: {reasoning.content_type} "
-                           f"(confidence={reasoning.confidence:.2f})")
+                           f"(confidence={reasoning.confidence:.2f}, mode={self._current_vision_mode})")
             
             # Update last check time
             self._last_vision_check_time = time.time()

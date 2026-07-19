@@ -81,6 +81,30 @@ ANIMATION_STATES = {
         "loop": True,
         "emote": "😕",
     },
+    "curious": {
+        "label": "Curious",
+        "description": "Screen changed — investigating what the user is doing",
+        "tint": QColor(200, 220, 255, 30),
+        "duration_ms": 0,
+        "loop": True,
+        "emote": "🧐",
+    },
+    "success": {
+        "label": "Satisfied",
+        "description": "Command executed successfully",
+        "tint": QColor(100, 255, 130, 25),
+        "duration_ms": 2000,
+        "loop": False,
+        "emote": "✅",
+    },
+    "frustrated": {
+        "label": "Frustrated",
+        "description": "Command failed or inference error",
+        "tint": QColor(255, 130, 100, 30),
+        "duration_ms": 2500,
+        "loop": False,
+        "emote": "😤",
+    },
 }
 
 

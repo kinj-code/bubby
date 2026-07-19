@@ -14,6 +14,10 @@ import signal
 faulthandler.enable()
 faulthandler.register(signal.SIGUSR1, all_threads=True)
 
+# ── Load .env before ANY other imports ───────────────────────────
+from dotenv import load_dotenv
+load_dotenv()
+
 import logging
 import sys
 from typing import Optional
@@ -148,13 +152,15 @@ def main() -> None:
     )
 
     def _on_display_message(text, animation, event_type):
-        if avatar_widget:
-            avatar_widget.set_state(animation, text)
+        # ONLY show the message text — don't double-set avatar state
+        # (avatar state is managed by _on_update_state signal)
         overlay.show_message(text=text, animation=animation, event_type=event_type)
 
     def _on_update_state(state_name, message_text):
         if avatar_widget:
             avatar_widget.set_state(state_name, message_text)
+        # Also update overlay animation
+        overlay.set_state(state_name, message_text)
 
     overlay.display_message_signal.connect(_on_display_message)
     overlay.update_state_signal.connect(_on_update_state)

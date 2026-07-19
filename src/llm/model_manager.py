@@ -159,14 +159,17 @@ class ModelManager:
         self._local_llm_path = os.environ.get("BUBBY_LLM_PATH", "").strip()
         if self._local_llm_path:
             local_path = Path(self._local_llm_path)
+            logger.info(f"BUBBY_LLM_PATH env var is set to: {local_path}")
             if local_path.exists():
-                logger.info(f"Using BUBBY_LLM_PATH: {local_path}")
+                logger.info(f"Loading local LLM from {local_path}")
             else:
                 logger.warning(
                     f"No local GGUF model found at {local_path}. "
                     f"Please download a GGUF model and place it there, "
                     f"or set BUBBY_LLM_PATH to point to an existing .gguf file."
                 )
+        else:
+            logger.info("BUBBY_LLM_PATH not set — will auto-select from catalog if a model is downloaded")
         
         logger.info(f"ModelManager initialized (dir: {self._models_dir})")
     

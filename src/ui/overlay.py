@@ -171,7 +171,7 @@ class OverlayWindow(QWidget):
 
     # Wandering
     WANDER_INTERVAL_MS = 12_000  # Wander every 12 seconds when idle
-    WANDER_DURATION_MS = 3_500   # Movement takes 3.5 seconds
+    WANDER_DURATION_MS = 3_000   # Movement takes exactly 3 seconds
 
     def __init__(
         self,
@@ -512,6 +512,61 @@ class OverlayWindow(QWidget):
             if not self._current_anim.advance():
                 self._sprite_timer.stop()
             self.update()
+        self._update_mask()
+
+    def _update_mask(self) -> None:
+        """Apply window mask from sprite alpha channel for true X11 transparency.
+
+        Cuts the window to the shape of the character's visible pixels
+        plus the input box area. Eliminates the blue background box entirely.
+        """
+        from PySide6.QtGui import QBitmap, QImage
+        w, h = self.width(), self.height()
+        if w <= 0 or h <= 0:
+            return
+
+        mask = QBitmap(w, h)
+        mask.fill(Qt.GlobalColor.color0)
+
+        p = QPainter(mask)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Include sprite pixels
+        if self._current_anim and self._current_anim.playing:
+            pix = self._current_anim.current_pixmap()
+            if pix and not pix.isNull():
+                scaled = pix.scaled(
+                    w, h,
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
+                x = (w - scaled.width()) // 2
+                y = (h - scaled.height()) // 2
+                # Convert to mask: transparent stays 0 (invisible), opaque → 1
+                sprite_mask = scaled.createMaskFromColor(
+                    QColor(0, 0, 0, 0), Qt.MaskMode.MaskOutColor
+                )
+                p.drawPixmap(x, y, sprite_mask)
+
+        # Always include input box area so user can type
+        if hasattr(self, '_input_box') and self._input_box.isVisible():
+            input_rect = self._input_box.geometry()
+            # Expand slightly so the border is included
+            input_rect = input_rect.adjusted(-2, -2, 2, 4)
+            p.fillRect(input_rect, Qt.GlobalColor.color1)
+
+        # Always include state label area
+        if self._state_label and self._state_label.isVisible():
+            label_rect = self._state_label.geometry()
+            label_rect = label_rect.adjusted(-2, -2, 2, 4)
+            p.fillRect(label_rect, Qt.GlobalColor.color1)
+
+        # Always include close zone
+        if self._close_zone_enabled and not self._click_through:
+            p.fillRect(self._close_zone_rect(), Qt.GlobalColor.color1)
+
+        p.end()
+        self.setMask(mask)
 
     # ── Qt events ─────────────────────────────────────────────────
 

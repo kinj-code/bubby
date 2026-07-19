@@ -231,7 +231,7 @@ def run_mission():
         try:
             from concurrent.futures import ThreadPoolExecutor, TimeoutError as FutureTimeout
             def _probe():
-                synthesis_engine._template_engine.synthesize(
+                synth_engine._template_engine.synthesize(
                     reasoning=None,
                     context_text="health_check",
                     trigger_type="status",
@@ -261,6 +261,7 @@ def run_mission():
 
     # ── Start everything ──
     watchdog.start()
+    watchdog.heartbeat()  # Reset stall timer immediately after start
     autonomy_loop.start()
     vision_pipeline.start(capture_interval=5.0)
     handler.on_greeting(context="autonomous_startup")

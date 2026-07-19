@@ -7,10 +7,7 @@
 
 pub mod memory;
 pub mod vector;
-
-// Python bindings in a future phase (requires proper PyO3 setup)
-// #[cfg(feature = "python-bindings")]
-// pub mod python;
+pub mod ipc;
 
 /// Core version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

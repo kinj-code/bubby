@@ -70,7 +70,7 @@ class LocalBridgeServer:
     5. MobileSensor subscribes to EventBus for consolidated IPC
     """
 
-    DEFAULT_HOST = "0.0.0.0"  # Listen on all interfaces (local network only)
+    DEFAULT_HOST = "127.0.0.1"  # Loopback only — safe by default
     DEFAULT_PORT = 9877       # Non-privileged port
 
     def __init__(

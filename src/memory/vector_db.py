@@ -1,6 +1,7 @@
 """Lightweight vector database for memory retrieval (with numpy fallback)."""
 
 import logging
+import threading
 import time
 import json
 from typing import List, Optional, Dict, Any, Tuple
@@ -84,11 +85,16 @@ class VectorStore:
         
         # State
         self._faiss_available = False
+        # Use list for O(1) append; batch-convert to ndarray for search
+        self._embeddings_list: List[np.ndarray] = []
         self._embeddings: np.ndarray = np.zeros((0, embedding_dim), dtype=np.float32)
+        self._embeddings_dirty = False  # True when list and ndarray are out of sync
         self._records: List[MemoryRecord] = []
         self._next_id = 0
         self._total_queries = 0
         self._total_adds = 0
+        self._lock = threading.RLock()  # Thread safety for concurrent add/search/save
+        self._batch_size = 100  # Flush list to ndarray every N adds
         
         # File paths
         self._embeddings_file = self._storage_dir / "vector_embeddings.npy"
@@ -154,22 +160,33 @@ class VectorStore:
         if norm > 0:
             emb_norm = emb_norm / norm
         
-        # Add to embeddings array
-        if self._embeddings.size > 0:
-            self._embeddings = np.vstack([self._embeddings, emb_norm])
-        else:
-            self._embeddings = emb_norm
-        
-        # Store record
-        self._records.append(record)
-        self._total_adds += 1
-        
-        # Auto-save periodically
-        if self._total_adds % 10 == 0:
-            self.save()
+        with self._lock:
+            # O(1) append to list — no vstack reallocation
+            self._embeddings_list.append(emb_norm)
+            self._embeddings_dirty = True
+            self._records.append(record)
+            self._total_adds += 1
+
+            # Flush list to contiguous ndarray periodically
+            if self._total_adds % self._batch_size == 0:
+                self._flush_embeddings()
+
+            # Auto-save periodically (now at batch boundary)
+            if self._total_adds % 10 == 0:
+                self.save()
         
         return record_id
     
+    def _flush_embeddings(self) -> None:
+        """Batch-convert embeddings list to contiguous ndarray (O(N) once per batch)."""
+        if not self._embeddings_dirty:
+            return
+        if self._embeddings_list:
+            self._embeddings = np.vstack(self._embeddings_list)
+        else:
+            self._embeddings = np.zeros((0, self._embedding_dim), dtype=np.float32)
+        self._embeddings_dirty = False
+
     def search(
         self,
         query_embedding: np.ndarray,
@@ -188,22 +205,27 @@ class VectorStore:
             List of (record, similarity_score) tuples, sorted by score
         """
         self._total_queries += 1
-        
-        if len(self._records) == 0 or self._embeddings.shape[0] == 0:
-            return []
-        
-        n_results = min(k, len(self._records))
-        
-        # Normalize query
-        query_norm = query_embedding.reshape(1, -1).astype(np.float32)
-        norm = np.linalg.norm(query_norm)
-        if norm > 0:
-            query_norm = query_norm / norm
-        
-        if self._faiss_available:
-            return self._search_faiss(query_norm, n_results, min_score)
-        else:
-            return self._search_numpy(query_norm, n_results, min_score)
+
+        with self._lock:
+            if len(self._records) == 0:
+                return []
+            # Ensure ndarray is current before search
+            self._flush_embeddings()
+            if self._embeddings.shape[0] == 0:
+                return []
+
+            n_results = min(k, len(self._records))
+
+            # Normalize query
+            query_norm = query_embedding.reshape(1, -1).astype(np.float32)
+            norm = np.linalg.norm(query_norm)
+            if norm > 0:
+                query_norm = query_norm / norm
+
+            if self._faiss_available:
+                return self._search_faiss(query_norm, n_results, min_score)
+            else:
+                return self._search_numpy(query_norm, n_results, min_score)
     
     def _search_faiss(
         self,
@@ -290,11 +312,14 @@ class VectorStore:
     
     def clear(self) -> None:
         """Clear all memories (companion fresh start)."""
-        self._embeddings = np.zeros((0, self._embedding_dim), dtype=np.float32)
-        self._records.clear()
-        self._next_id = 0
-        self._total_adds = 0
-        self._total_queries = 0
+        with self._lock:
+            self._embeddings_list.clear()
+            self._embeddings = np.zeros((0, self._embedding_dim), dtype=np.float32)
+            self._embeddings_dirty = False
+            self._records.clear()
+            self._next_id = 0
+            self._total_adds = 0
+            self._total_queries = 0
         # Remove persisted files
         if self._embeddings_file.exists():
             self._embeddings_file.unlink()
@@ -303,20 +328,22 @@ class VectorStore:
         logger.info("Vector store cleared")
     
     def save(self) -> None:
-        """Save embeddings and records to disk."""
-        try:
-            np.save(str(self._embeddings_file), self._embeddings)
-            records_data = [r.to_dict() for r in self._records]
-            with open(self._records_file, 'w') as f:
-                json.dump({
-                    "next_id": self._next_id,
-                    "records": records_data,
-                    "total_adds": self._total_adds,
-                    "total_queries": self._total_queries
-                }, f, indent=2)
-            logger.debug(f"Saved {len(self._records)} memories to {self._storage_dir}")
-        except Exception as e:
-            logger.error(f"Failed to save: {e}")
+        """Save embeddings and records to disk (thread-safe)."""
+        with self._lock:
+            self._flush_embeddings()
+            try:
+                np.save(str(self._embeddings_file), self._embeddings)
+                records_data = [r.to_dict() for r in self._records]
+                with open(self._records_file, 'w') as f:
+                    json.dump({
+                        "next_id": self._next_id,
+                        "records": records_data,
+                        "total_adds": self._total_adds,
+                        "total_queries": self._total_queries
+                    }, f, indent=2)
+                logger.debug(f"Saved {len(self._records)} memories to {self._storage_dir}")
+            except Exception as e:
+                logger.error(f"Failed to save: {e}")
     
     def _load(self) -> None:
         """Load embeddings and records from disk."""

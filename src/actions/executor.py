@@ -8,8 +8,9 @@ RAM: Negligible (subprocess delegation uses OS memory).
 """
 
 import logging
-import subprocess
+import os
 import shlex
+import subprocess
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
 from enum import Enum
@@ -324,28 +325,37 @@ class SystemExecutor:
                 error="User approval required",
             )
 
-        # Build command string
-        cmd_str = command.command_template
+        # Build command argument list (shell=False — no injection possible)
+        # Parse the template as shell tokens, then substitute params
+        cmd_list = shlex.split(command.command_template)
 
-        # Substitute parameters
+        # Substitute parameters in-place
         for i, param in enumerate(request.params[:command.max_params]):
             placeholder = f"{{param{i + 1}}}"
-            # Basic sanitization: strip shell metacharacters
-            safe_param = param.replace("'", "").replace('"', "").replace("`", "").replace("$", "")
-            cmd_str = cmd_str.replace(placeholder, safe_param)
+            # Find and replace the placeholder in the list
+            for j, token in enumerate(cmd_list):
+                if placeholder in token:
+                    # Clean the param but keep safe chars (shell=False protects us from injection)
+                    clean = param.replace("'", "").replace('"', "").replace("`", "").replace("$", "")
+                    cmd_list[j] = token.replace(placeholder, clean)
+                    break
 
-        logger.info(f"Executing: [{command.name}] {cmd_str[:80]}")
+        logger.info(f"Executing: [{command.name}] {shlex.join(cmd_list)[:80]}")
 
         try:
-            # Execute with timeout and security constraints
+            # Execute with shell=False — injection mathematically impossible
+            # Restore minimal env for commands to resolve correctly
             result = subprocess.run(
-                cmd_str,
-                shell=True,
+                cmd_list,
+                shell=False,
                 capture_output=True,
                 text=True,
-                timeout=15,  # 15 second timeout
-                env={},      # Empty env for security (system commands don't need env)
-                cwd="/",     # Root dir for safety
+                timeout=15,
+                env={"PATH": os.environ.get("PATH", "/usr/local/bin:/usr/bin:/bin"),
+                     "HOME": os.environ.get("HOME", "/tmp"),
+                     "DISPLAY": os.environ.get("DISPLAY", ":0"),
+                     "DBUS_SESSION_BUS_ADDRESS": os.environ.get("DBUS_SESSION_BUS_ADDRESS", "")},
+                cwd=os.environ.get("HOME", "/"),
             )
 
             output = result.stdout.strip()

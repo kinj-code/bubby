@@ -1,210 +1,73 @@
-<p align="center">
-  <img src="https://raw.githubusercontent.com/twitter/twemoji/master/assets/svg/1f916.svg" width="80" alt="Bubby">
-</p>
+# Bubby — Desktop AI Companion
 
-<h1 align="center">🐞 Bubby</h1>
-<h3 align="center">Autonomous Desktop AI Companion — 100% Offline, 100% Private</h3>
-
-<p align="center">
-  <strong>5.4 GB RAM · i5 CPU · Linux (Zorin OS) · PySide6 + llama.cpp + Moondream2 + Piper TTS</strong>
-</p>
-
----
-
-## What is Bubby?
-
-Bubby is a **fully offline desktop AI companion** that lives on your Linux desktop. It has:
-
-- 🧠 **A Brain** — Local LLM (Qwen/Llama 1-1.5B quantized) with grammar-constrained JSON generation
-- 👀 **Eyes** — Moondream2 VLM for screen understanding
-- 🗣️ **A Voice** — Piper TTS for offline speech synthesis
-- 🎭 **An Avatar** — Floating transparent Qt overlay with 7 animated states
-- 🤲 **Hands** — 22 whitelisted system commands (battery, disk, brightness, etc.)
-- 📚 **A Library** — FAISS RAG pipeline with Knowledge Graph for document reasoning
-- 🔄 **Self-Refining Memory** — Feedback engine that learns which retrievals are helpful
-- 🛡️ **Cognitive Critic** — Safety layer that blocks hallucinations before output
-- 📡 **Sensors** — Terminal error detection, calendar monitoring, mobile bridge
-
-All running on **~5.4 GB of RAM** on an Intel i5 processor. No cloud. No API keys. No internet.
-
----
-
-## Architecture
-
-```
-┌────────── SENSORS ───────────────────────────────────────┐
-│ Vision(PySide6) · Terminal(/tmp/bubby_*) · Mobile(TCP)   │
-│ Calendar(~/Documents/*.ics)                              │
-├──────────────────────────────────────────────────────────┤
-│             ↓                                            │
-├────────── COGNITION ────────────────────────────────────┤
-│ VLM(Moondream2) → LLM(Qwen/Llama with JSON grammar)      │
-│ RAG(FAISS) → KnowledgeGraph(NetworkX) → Feedback(sqlite3)│
-│ Critic(Utility+Safety+Redundancy) ←→ Proactivity(5-factor)│
-├──────────────────────────────────────────────────────────┤
-│             ↓                                            │
-├────────── OUTPUT ───────────────────────────────────────┤
-│ Avatar(Qt+7 states) · PiperTTS · SystemActions(22 cmds)  │
-├──────────────────────────────────────────────────────────┤
-│             ↓                                            │
-├────────── HARDENING ────────────────────────────────────┤
-│ EventBus(IPC) · Profiler · Watchdog · CheckpointManager  │
-│ ThreadPoolExecutor(inference) · 5.4 GB AI · 100% Offline │
-└──────────────────────────────────────────────────────────┘
-```
-
----
+Bubby is a local, offline AI companion that runs on your Linux desktop. It watches your screen, monitors your terminal for errors, checks your calendar, and proactively offers help — all running on your own hardware with no internet dependency.
 
 ## Quick Start
 
 ```bash
-# 1. Clone the repository
-git clone https://github.com/YOUR_USERNAME/bubby.git
+git clone git@github.com:kinj-code/bubby.git
 cd bubby
-
-# 2. Install dependencies
-pip install -r requirements.txt
-
-# 3. Download models (first time only)
-python scripts/download_llm.py --best
-python scripts/download_voice.py --best
-
-# 4. Index your study materials
-python -c "
-from src.memory.parser import DocumentParser
-from src.memory.ingestion import DocumentIngestion
-from src.memory.embedding import EmbeddingEngine
-from src.memory.vector_db import VectorStore
-e = EmbeddingEngine()
-v = VectorStore()
-d = DocumentIngestion(e, v)
-d.ingest_directory('/path/to/your/documents')
-"
-
-# 5. Launch the companion
-BUBBY_USE_LLM=1 BUBBY_USE_TTS=1 python src/app.py
+bash setup.sh
+source .venv/bin/activate
+python3 run_autonomous.py
 ```
 
----
+Requires Python 3.11+, a Wayland desktop, and ~8GB free RAM. A local GGUF language model (3B parameters recommended) is auto-detected if you have GPT4All installed.
 
-## Project Structure
+## How It Works
 
-```
-bubby/
-├── src/
-│   ├── brain/          # Behavior tree, autonomy loop, proactivity, critic, graph builder
-│   ├── vision/         # VLM engine, screen capture, change detection
-│   ├── memory/         # Embedding, FAISS vector DB, long-term memory, RAG parser
-│   │                   #   ingestion, feedback engine, knowledge graph, synthetic gen
-│   ├── persona/        # Synthesis engine, LLM synthesis, prompts, RAG bridge
-│   ├── interaction/    # Interaction handler (UI + TTS + action routing)
-│   ├── llm/            # llama-cpp-python inference with ThreadPoolExecutor + JSON grammar
-│   ├── voice/          # Piper TTS engine
-│   ├── ui/             # Transparent Qt overlay, avatar animation engine
-│   ├── actions/        # Whitelisted system command executor (22 commands)
-│   ├── sensors/        # Terminal sensor, mobile bridge sensor
-│   ├── network/        # Local TCP bridge server + EventBus for consolidated IPC
-│   ├── integrations/   # Calendar sensor (.ics parser)
-│   ├── perf/           # Pipeline profiler, process watchdog
-│   ├── data/           # State persistence & checkpoint manager
-│   └── app.py          # Main application entry point
-├── scripts/            # Model downloaders (LLM, voice, VLM)
-├── mobile/             # Android Kotlin bridge service
-├── test_*.py           # Integration test suites (15+ test files)
-├── run_autonomous.py   # Mission Control — autonomous daemon loop
-└── requirements.txt
-```
+Bubby runs as a headless daemon with four pipelines:
 
----
+1. **Vision** — captures screen state and reasons about what you're doing
+2. **Sensors** — polls your terminal exit codes and iCalendar files for deadlines
+3. **Cognition** — routes observations through a behavior tree into persona-aware synthesis
+4. **Critic+Policy** — validates LLM output for groundedness, safety, and provenance before it reaches you
 
-## Modules by Phase
+All inference runs locally via `llama-cpp-python`. No API keys, no cloud, no telemetry.
 
-| Phase | System | Key Files |
-|---|---|---|
-| 1-4 | **Vision + Brain** | `vision/pipeline.py`, `brain/autonomy_loop.py`, `brain/reasoning.py`, `ui/overlay.py` |
-| 5 | **Memory** | `memory/embedding.py`, `memory/vector_db.py`, `memory/long_term_memory.py` |
-| 6 | **Interaction** | `interaction/handler.py`, `persona/synthesis.py` |
-| 7 | **LLM Integration** | `llm/inference.py`, `persona/prompts.py`, `persona/response_parser.py` |
-| 8 | **Omni-Integration** | `ui/avatar.py`, `voice/tts_engine.py`, `actions/executor.py` |
-| 9 | **Proactive Autonomy** | `brain/proactivity.py`, `brain/critic.py`, `sensors/terminal.py` |
-| 10 | **Mobile Bridge** | `network/local_server.py`, `sensors/mobile.py`, `mobile/OfflineBridgeService.kt` |
-| 11 | **RAG Pipeline** | `memory/parser.py`, `memory/ingestion.py`, `persona/rag_bridge.py` |
-| 12 | **Self-Refining Memory** | `memory/feedback.py`, `memory/knowledge_graph.py`, `brain/graph_builder.py` |
-| 13 | **Hardening + Workflow** | `perf/profiler.py`, `perf/watchdog.py`, `integrations/calendar.py` |
+## Configuration
 
----
+Copy `.env.example` to `.env` and adjust:
 
-## RAM Budget (Reconciled — Item 6 Audit)
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `BUBBY_USE_LLM` | `1` | Set to `0` for template-only responses (no model needed) |
+| `BUBBY_USE_TTS` | `0` | Set to `1` to enable Piper text-to-speech |
+| `QT_QPA_PLATFORM` | `offscreen` | Use `wayland` for GUI mode with avatar overlay |
 
-| Component | Module(s) | RAM (MB) |
-|---|---|---|
-| Moondream2 VLM (INT8) | `src/vision/vlm_engine.py` | 1,800 |
-| Sub-3B LLM (Q4_K_M) | `src/llm/inference.py` | 2,704 |
-| Embedding model (all-MiniLM-L6) | `src/memory/embedding.py` | 300 |
-| Qt/Python overhead (PySide6 + runtime) | `src/ui/overlay.py`, `src/app.py` | 500 |
-| Piper TTS (ONNX) | `src/voice/tts_engine.py` | 50 |
-| Avatar UI (Qt widgets + animation) | `src/ui/avatar.py`, `src/ui/animation_engine.py` | 100 |
-| Vector DB (FAISS) | `src/memory/vector_db.py` | 80 |
-| Knowledge Graph (NetworkX) | `src/memory/knowledge_graph.py` | 10 |
-| Feedback DB (sqlite3) | `src/memory/feedback.py` | 5 |
-| RAG pipeline (parser + ingestion) | `src/memory/parser.py`, `src/memory/ingestion.py` | 2 |
-| Profiler + Watchdog + Calendar | `src/perf/`, `src/integrations/` | 7 |
-| Mobile Bridge (async TCP) | `src/network/local_server.py` | 5 |
-| EventBus (in-memory dict) | `src/network/event_bus.py` | <1 |
-| ThreadPoolExecutor overhead | `src/llm/inference.py` (shared) | 2 |
-| **TOTAL AI Stack** | | **~5,566 MB (5.4 GB)** |
-| **Free for OS/apps (16 GB total)** | | **~10,434 MB (10.2 GB)** |
-
----
-
-## System Actions (Whitelisted)
-
-The companion can execute these 22 commands after safety validation:
-
-| Category | Commands |
-|---|---|
-| **System Info** | `check_battery`, `check_disk`, `check_memory`, `check_uptime`, `check_cpu`, `check_date`, `check_weather` |
-| **Utility** | `open_terminal`, `open_calculator`, `open_files`, `open_browser`, `open_settings`, `open_vscode`, `take_screenshot` |
-| **Power** | `lock_screen`*, `sleep_system`* |
-| **Display** | `brightness_up`, `brightness_down`, `volume_up`, `volume_down`, `volume_mute` |
-
-*\*requires user approval*
-
----
-
-## Running Autonomous (168-Hour Stress Test)
+## Running
 
 ```bash
-# Pre-flight
-sudo systemctl mask sleep.target suspend.target hibernate.target
-python test_phase_12_unified.py
+# Foreground (logs to terminal + file)
+python3 run_autonomous.py
 
-# Launch mission
-nohup python run_autonomous.py > logs/session_output.log 2>&1 &
+# Background (168-hour stress test)
+nohup .venv/bin/python3 run_autonomous.py > logs/session_output.log 2>&1 &
 
-# Monitor
-tail -f logs/mission_control.log
+# View live logs
+tail -f logs/session_output.log
 ```
 
----
+## Architecture
+
+```
+src/
+├── actions/       Action whitelist + provenance policy
+├── brain/         Autonomy loop, behavior tree, reasoning
+├── integrations/  Calendar sensor (.ics parser)
+├── interaction/   Output pipeline (critic → policy → display)
+├── llm/           llama-cpp inference wrapper
+├── memory/        Vector DB (FAISS), embeddings, knowledge graph
+├── network/       Event bus, local TCP bridge (for mobile pairing)
+├── persona/       Template + LLM synthesis, prompts
+├── sensors/       Terminal error monitor
+├── vision/        Screen capture pipeline
+└── voice/         Piper TTS integration
+```
 
 ## Requirements
 
-- **OS:** Linux (Ubuntu 22.04+, Zorin OS, or compatible)
-- **Python:** 3.10+
-- **RAM:** 16 GB recommended (works on 8 GB with lighter models)
-- **CPU:** Intel i5 or equivalent (4+ cores)
-- **GPU:** None required (100% CPU inference)
-- **Storage:** ~5 GB for models + documents
-
----
-
-## License
-
-MIT — see [LICENSE](LICENSE) for details.
-
----
-
-<p align="center">
-  <sub>Built with ❤️ on Zorin OS. No cloud. No API keys. Just local inference.</sub>
-</p>
+- Linux (Wayland)
+- Python 3.11+
+- ~8GB free RAM (16GB recommended)
+- ~2GB disk for a 3B GGUF model

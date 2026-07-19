@@ -1,13 +1,21 @@
-PySide6
-numpy
-Pillow
-dbus-next
-pipewire-capture
-python-dotenv
-# Phase 3, Part 2: VLM Integration
+# Core dependencies
+PySide6>=6.5.0
+numpy>=1.24.0
+Pillow>=10.0.0
+python-dotenv>=1.0.0
+
+# LLM inference (local GGUF models)
+llama-cpp-python>=0.3.0
+
+# Embeddings & vector search
+sentence-transformers>=3.0.0
+faiss-cpu>=1.7.0
+
+# VLM (optional, for screen awareness)
 torch>=2.0.0
 transformers>=4.30.0
-huggingface-hub>=0.16.0
+huggingface-hub>=0.20.0
 accelerate>=0.20.0
-# Phase 7A: Local LLM Integration
-llama-cpp-python>=0.2.70
+
+# Voice (optional, for speech output)
+# piper-tts  # Uncomment if using Piper TTS

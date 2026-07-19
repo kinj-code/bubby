@@ -169,6 +169,14 @@ def main() -> None:
 
     overlay.user_poked.connect(_on_user_poked)
 
+    # ── Chat input → LLM response ──
+    def _on_user_message(text: str) -> None:
+        """User typed a message in the overlay input box."""
+        logger.info(f"User input from overlay: {text[:60]}")
+        interaction_handler.on_user_input(text)
+
+    overlay.user_message_submitted.connect(_on_user_message)
+
     autonomy_loop = AutonomyLoop(
         behavior_tree=behavior_tree, context_manager=context_manager, decision_interval=2.0,
     )

@@ -18,7 +18,7 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtWidgets import QWidget, QApplication, QLabel
+from PySide6.QtWidgets import QWidget, QApplication, QLabel, QLineEdit
 from PySide6.QtCore import (
     Qt, QPoint, QTimer, QSize, Signal, QPropertyAnimation,
     QEasingCurve, QRect,
@@ -162,6 +162,8 @@ class OverlayWindow(QWidget):
     dragging_changed = Signal(bool)
     # Emitted when user clicks the character body (not close button)
     user_poked = Signal()
+    # Emitted when user types a message and presses Enter in the input box
+    user_message_submitted = Signal(str)
 
     CLOSE_ZONE_SIZE = 24
     CLOSE_ZONE_COLOR = QColor(255, 59, 48, 180)
@@ -206,6 +208,7 @@ class OverlayWindow(QWidget):
         self._wander_timer.start(self.WANDER_INTERVAL_MS)
 
         self._setup_window()
+        self._setup_input_box()
         self._setup_close_zone_timer()
 
         # Start default animation
@@ -223,11 +226,46 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
-        self.setAutoFillBackground(False)
-        self.setStyleSheet("background: transparent;")
         self.set_click_through(self._click_through)
         self.setFixedSize(*self._window_size)
         self.setMouseTracking(True)
+
+    def _setup_input_box(self) -> None:
+        """Create a text input box for chatting with Bubby."""
+        w, h = self._window_size
+        input_height = 32
+        self._input_box = QLineEdit(self)
+        self._input_box.setPlaceholderText("Chat with Bubby...")
+        self._input_box.setGeometry(8, h - input_height - 8, w - 16, input_height)
+        self._input_box.setStyleSheet("""
+            QLineEdit {
+                background: rgba(20, 20, 30, 180);
+                color: rgba(255, 255, 255, 230);
+                border: 1px solid rgba(100, 180, 220, 120);
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 1px solid rgba(100, 180, 220, 200);
+            }
+        """)
+        self._input_box.returnPressed.connect(self._on_input_submitted)
+        # Hide by default — user can type to show
+        self._input_box.show()
+
+    def _on_input_submitted(self) -> None:
+        """Handle Enter key in the input box."""
+        text = self._input_box.text().strip()
+        if text:
+            logger.debug(f"User submitted message: {text[:60]}")
+            self.user_message_submitted.emit(text)
+        self._input_box.clear()
+
+    def set_input_visible(self, visible: bool) -> None:
+        """Show or hide the text input box."""
+        if hasattr(self, '_input_box'):
+            self._input_box.setVisible(visible)
 
     def _setup_close_zone_timer(self) -> None:
         self._close_zone_timer = QTimer(self)
@@ -479,12 +517,18 @@ class OverlayWindow(QWidget):
 
     def paintEvent(self, event) -> None:  # noqa: ARG002
         try:
-            # State tint
+            # IMPORTANT: Do NOT fill the entire rect with a solid color.
+            # The background must remain 100% transparent on X11/Linux.
+            # Only draw specific overlays (sprite, close button) on top
+            # of the transparent background.
+
+            # State tint — only draw if explicitly set (event-specific highlight)
             with self._state_lock:
                 tint = self._current_tint
             if tint is not None:
                 p = QPainter(self)
                 p.setRenderHint(QPainter.RenderHint.Antialiasing)
+                p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
                 p.fillRect(self.rect(), tint)
                 p.end()
 

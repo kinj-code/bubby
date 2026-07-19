@@ -412,6 +412,10 @@ class LLMSynthesisEngine:
             stats["llm_stats"] = self._llm_inference.get_stats()
         return stats
     
+    def get_greeting(self, context: str = "idle") -> str:
+        """Get a persona-appropriate greeting (delegates to template engine)."""
+        return self._template_engine.get_greeting(context)
+
     def shutdown(self) -> None:
         """Clean up resources."""
         if self._llm_inference:

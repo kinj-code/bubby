@@ -23,13 +23,14 @@ logger = logging.getLogger(__name__)
 class LLMConfig:
     """Configuration for LLM inference."""
     
-    # Model path
+    # Model path (can be set via BUBBY_LLM_PATH env var or .env)
     model_path: str = ""
     
     # Context & generation
-    n_ctx: int = 2048              # Context window size
+    n_ctx: int = 4096              # Context window size
     n_batch: int = 512             # Batch size for prompt processing
     n_threads: int = 4             # CPU threads (match i5 cores)
+    n_gpu_layers: int = -1         # -1 = offload all layers to GPU (Metal/CUDA/Vulkan)
     
     # Generation parameters
     temperature: float = 0.7       # Creativity (0.0 = deterministic)
@@ -150,6 +151,7 @@ class LLMInference:
                     n_ctx=self._config.n_ctx,
                     n_batch=self._config.n_batch,
                     n_threads=self._config.n_threads,
+                    n_gpu_layers=self._config.n_gpu_layers,
                     use_mlock=self._config.use_mlock,
                     use_mmap=self._config.use_mmap,
                     verbose=self._config.verbose,

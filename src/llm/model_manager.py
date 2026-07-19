@@ -155,6 +155,19 @@ class ModelManager:
         self._cache_file = self._models_dir / ".model_cache.json"
         self._downloaded_models: Dict[str, Dict[str, Any]] = self._load_cache()
         
+        # Check for user-specified local model path
+        self._local_llm_path = os.environ.get("BUBBY_LLM_PATH", "").strip()
+        if self._local_llm_path:
+            local_path = Path(self._local_llm_path)
+            if local_path.exists():
+                logger.info(f"Using BUBBY_LLM_PATH: {local_path}")
+            else:
+                logger.warning(
+                    f"No local GGUF model found at {local_path}. "
+                    f"Please download a GGUF model and place it there, "
+                    f"or set BUBBY_LLM_PATH to point to an existing .gguf file."
+                )
+        
         logger.info(f"ModelManager initialized (dir: {self._models_dir})")
     
     def _load_cache(self) -> Dict[str, Dict[str, Any]]:
@@ -207,12 +220,6 @@ class ModelManager:
         model_path = self._models_dir / self._downloaded_models[model_id]["filename"]
         return model_path.exists()
     
-    def get_model_path(self, model_id: str) -> Optional[Path]:
-        """Get path to downloaded model."""
-        if not self.is_downloaded(model_id):
-            return None
-        info = self._downloaded_models[model_id]
-        return self._models_dir / info["filename"]
     
     def get_model_info(self, model_id: str) -> Optional[ModelInfo]:
         """Get model info from catalog."""
@@ -400,7 +407,14 @@ class ModelManager:
             return False
     
     def get_best_model(self) -> Optional[str]:
-        """Get the best available downloaded model (prefers recommended)."""
+        """Get the best available downloaded model (prefers recommended).
+        
+        Priority: BUBBY_LLM_PATH env var > recommended catalog model > any downloaded.
+        """
+        # Check BUBBY_LLM_PATH env var first
+        if self._local_llm_path and Path(self._local_llm_path).exists():
+            return None  # Signal to use direct path, not catalog lookup
+        
         downloaded = self.list_downloaded_models()
         if not downloaded:
             return None
@@ -412,6 +426,37 @@ class ModelManager:
         
         # Fallback: first downloaded
         return downloaded[0]["model_id"]
+
+    def get_model_path(self, model_id: str) -> Optional[Path]:
+        """Get path to downloaded model.
+        
+        If BUBBY_LLM_PATH is set and the file exists, returns that path directly
+        regardless of model_id.
+        """
+        # Priority: environment variable override
+        if self._local_llm_path:
+            env_path = Path(self._local_llm_path)
+            if env_path.exists():
+                return env_path
+            else:
+                logger.warning(
+                    f"No local GGUF model found at {env_path}. "
+                    f"Please download a GGUF model and place it there."
+                )
+                return None
+
+        if not self.is_downloaded(model_id):
+            return None
+        info = self._downloaded_models[model_id]
+        return self._models_dir / info["filename"]
+
+    def get_local_llm_path(self) -> Optional[Path]:
+        """Get the BUBBY_LLM_PATH value if set and the file exists."""
+        if self._local_llm_path:
+            p = Path(self._local_llm_path)
+            if p.exists():
+                return p
+        return None
     
     def print_catalog(self) -> None:
         """Print model catalog to console."""

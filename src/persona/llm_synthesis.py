@@ -108,25 +108,35 @@ class LLMSynthesisEngine:
             
             # Initialize model manager if not provided
             if self._llm_inference is None:
-                # Auto-select best model
-                model_id = self._config.model_id or self._model_manager.get_best_model()
+                # Priority 1: BUBBY_LLM_PATH env var (direct path override)
+                local_path = self._model_manager.get_local_llm_path()
+                if local_path:
+                    model_path = local_path
+                else:
+                    # Priority 2: Auto-select best catalog model
+                    model_id = self._config.model_id or self._model_manager.get_best_model()
+                    if not model_id:
+                        logger.warning("No LLM model available")
+                        self._llm_ready = True  # Mark as checked to avoid retry
+                        return False
+                    model_path = self._model_manager.get_model_path(model_id)
                 
-                if not model_id:
-                    logger.warning("No LLM model available")
-                    self._llm_ready = True  # Mark as checked to avoid retry
-                    return False
-                
-                model_path = self._model_manager.get_model_path(model_id)
-                if not model_path:
-                    logger.warning(f"Model {model_id} not downloaded")
+                if not model_path or not model_path.exists():
+                    path_str = str(model_path) if model_path else "unknown"
+                    logger.warning(
+                        f"No local GGUF model found at {path_str}. "
+                        f"Please download a GGUF model and set BUBBY_LLM_PATH "
+                        f"or use scripts/download_llm.py to download from catalog."
+                    )
                     self._llm_ready = True
                     return False
                 
-                # Create LLM config
+                # Create LLM config with in-process llama.cpp settings
                 llm_config = LLMConfig(
                     model_path=str(model_path),
                     n_threads=4,
-                    n_ctx=2048,
+                    n_ctx=4096,
+                    n_gpu_layers=-1,
                     temperature=self._config.temperature,
                     max_tokens=self._config.max_response_tokens,
                     persona=self._persona,

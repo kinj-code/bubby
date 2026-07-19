@@ -280,20 +280,30 @@ def run_mission():
         watchdog.heartbeat()
         profiler.start("sensor_polling")
 
-        # Terminal sensor
+        # Terminal sensor — route through handler for companion output
         try:
             term_state = terminal.poll()
             if term_state.event.value != "unknown" and term_state.urgency > 0.5:
-                logger.info(f"TERMINAL: {term_state.event.value} (urgency={term_state.urgency:.2f})")
+                event_text = f"Terminal error detected: {term_state.event.value}. {term_state.error_summary}"
+                handler.on_sensor_event(
+                    event_text=event_text,
+                    urgency=term_state.urgency,
+                    source="terminal",
+                )
         except Exception as e:
             logger.debug(f"Terminal poll: {e}")
 
-        # Calendar sensor
+        # Calendar sensor — route through handler for companion output
         try:
             cal_events = calendar.poll()
             for evt in cal_events:
                 if evt.is_imminent:
-                    logger.info(f"CALENDAR: '{evt.title}' in {evt.minutes_until:.0f} min")
+                    event_text = f"Calendar alert: '{evt.title}' in {evt.minutes_until:.0f} minutes"
+                    handler.on_sensor_event(
+                        event_text=event_text,
+                        urgency=evt.urgency,
+                        source="calendar",
+                    )
         except Exception as e:
             logger.debug(f"Calendar poll: {e}")
 

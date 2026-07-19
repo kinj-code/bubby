@@ -28,6 +28,7 @@ class InteractionEvent(str, Enum):
     RESPONSE = "response"
     ERROR = "error"
     STATUS = "status"
+    ALERT = "alert"
 
 
 @dataclass
@@ -306,6 +307,67 @@ class InteractionHandler:
         self._add_message(message)
         return message
     
+    def on_sensor_event(
+        self,
+        event_text: str,
+        urgency: float = 0.5,
+        source: str = "sensor",
+    ) -> Optional[InteractionMessage]:
+        """
+        Handle a sensor-triggered event (terminal error, calendar deadline, etc.).
+
+        High-urgency events bypass the cooldown and are always spoken.
+        Low-urgency events are synthesized but may be suppressed by the budget.
+
+        Args:
+            event_text: Human-readable description of the event
+            urgency: 0.0-1.0 urgency score
+            source: Where this came from (e.g. 'terminal', 'calendar')
+
+        Returns:
+            InteractionMessage or None if suppressed
+        """
+        # High-urgency events bypass cooldowns
+        if urgency < 0.5:
+            if self._is_state_change_cooldown_active():
+                logger.debug(f"Sensor event suppressed (low urgency + cooldown active): {event_text[:50]}")
+                return None
+
+        # Synthesize response
+        response = self._engine.synthesize(
+            reasoning=None,
+            context_text=event_text,
+            trigger_type="sensor_event",
+        )
+
+        # ── Run response through cognitive critic ──
+        response_dict = {
+            "animation": response.animation,
+            "speech": response.text,
+            "action": getattr(response, 'action', '') or '',
+        }
+        if self._critic:
+            self._critic.set_rag_context([], source=ActionSource.SENSOR_TRIGGER.value)
+            verdict = self._critic.review(response_dict)
+            response_dict = verdict.corrected_output
+            self._critic.clear_rag_context()
+
+        # Route any action through executor (with policy check)
+        action_name = response_dict.get("action", "")
+        if action_name and self._action_executor:
+            self._execute_action(action_name, event_text)
+
+        message = InteractionMessage(
+            text=response_dict.get("speech", ""),
+            event=InteractionEvent.ALERT if urgency > 0.7 else InteractionEvent.STATUS,
+            animation=response_dict.get("animation", "idle"),
+            source=source,
+        )
+
+        self._last_interaction_time = time.time()
+        self._add_message(message)
+        return message
+
     def on_status(self, status_text: str) -> InteractionMessage:
         """
         Send a status message (non-intrusive).

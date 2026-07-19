@@ -1,23 +1,20 @@
 """Main application entry point for Bubby desktop companion.
 
-Architecture (decoupled):
-┌─────────────────────────────────────────────────────┐
-│  AutonomyLoop (Qt QThread)                          │
-│    → decision_made Signal → on_decision()           │
-│    (thread-safe: emitted from worker, slot on main) │
-├─────────────────────────────────────────────────────┤
-│  Vision Pipeline → Reasoning → Synthesis            │
-│    → InteractionHandler.display_callback            │
-│    → OverlayWindow.display_message_signal (main thd)│
-│    → AvatarWidget.set_state() + TTS + Actions       │
-└─────────────────────────────────────────────────────┘
-
-All widget mutations go through Qt Signal/Slot — zero direct
-calls from background threads to UI objects.
+Architecture (decoupled, thread-safe via Qt Signal/Slot):
+- AutonomyLoop (QThread) emits decision_made Signal → main thread slot
+- Vision pipeline callbacks → InteractionHandler → overlay signal → main thread
+- Zero direct widget calls from background threads
 """
 
-import logging
+# ── Faulthandler: produce C/C++ stack trace on segfault ──────────
+# Must be the very first imports before any Qt libraries.
+import faulthandler
 import os
+import signal
+faulthandler.enable()
+faulthandler.register(signal.SIGUSR1, all_threads=True)
+
+import logging
 import sys
 from typing import Optional
 
@@ -27,17 +24,17 @@ if not os.environ.get("QT_QPA_PLATFORM"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QTimer, QPoint
 
 from src.ui.overlay import OverlayWindow
 from src.ui.avatar import AvatarWidget, AvatarConfig
-from src.brain.decisions import DecisionType, Decision, make_wander_decision
+from src.brain.decisions import DecisionType, Decision
 from src.brain.behavior_tree import (
     BehaviorTree, Selector, Sequence, Condition, Action
 )
 from src.brain.context_manager import ContextManager
 from src.brain.autonomy_loop import AutonomyLoop
-from src.brain.reasoning import VisualReasoning, ReasoningBridge
+from src.brain.reasoning import ReasoningBridge
 from src.vision.memory_buffer import MemoryBuffer
 from src.vision.pipeline import VisionPipeline
 from src.memory.long_term_memory import LongTermMemory
@@ -93,64 +90,36 @@ def main() -> None:
     app = QApplication(sys.argv)
     app.setQuitOnLastWindowClosed(True)
 
-    # ── LAYER 1: UI Overlay ──
     overlay = OverlayWindow(size=(400, 400), click_through=False)
-
-    # ── LAYER 2: Brain ──
     behavior_tree = create_behavior_tree()
     context_manager = ContextManager()
 
-    # ── LAYER 3: Vision & Memory ──
     vision_pipeline = VisionPipeline()
     memory_buffer = MemoryBuffer(max_observations=50, max_tokens=2048)
     long_term_memory = LongTermMemory()
-
-    # ── LAYER 4: Reasoning Bridge ──
     reasoning_bridge = ReasoningBridge(memory_buffer)
 
-    # ── LAYER 5: Persona & Synthesis ──
     persona = PersonaConfig(persona_type=PersonaType.WITTY_COMPANION)
     synthesis_config = LLMSynthesisConfig(
-        use_llm=USE_LLM,
-        fallback_to_template=True,
-        min_confidence_for_llm=0.5,
+        use_llm=USE_LLM, fallback_to_template=True, min_confidence_for_llm=0.5,
     )
     synthesis_engine = LLMSynthesisEngine(
-        persona=persona,
-        long_term_memory=long_term_memory,
-        config=synthesis_config,
+        persona=persona, long_term_memory=long_term_memory, config=synthesis_config,
     )
 
-    # ── LAYER 5.5: TTS Engine (Offline Voice) ──
     tts_config = TTSConfig(use_subprocess=True)
     tts_engine = TTSEngine(tts_config) if USE_TTS else None
-    if tts_engine and tts_engine.is_ready():
-        logger.info("TTS engine ready")
-    elif USE_TTS:
-        logger.info("TTS engine initialized (no voice model — download: scripts/download_voice.py)")
-
-    # ── LAYER 5.6: System Executor (Secure Actions) ──
     system_executor = SystemExecutor()
-    logger.info(f"System executor ready: {len(system_executor.get_available_actions())} actions")
 
-    # ── LAYER 1.5: Avatar Widget (inside overlay) ──
     avatar_config = AvatarConfig(
         show_emotes=True, show_text=True, emote_size=64, bob_animation=True,
     )
     avatar_widget = AvatarWidget(parent=overlay, config=avatar_config)
     avatar_widget.set_state("idle")
     overlay.set_animation_widget(avatar_widget)
-    logger.info("Avatar widget embedded in overlay")
 
-    # ── LAYER 6: Interaction Handler ──
-    #
-    # THREAD-SAFETY: display_callback emits overlay signals which
-    # are dispatched on the main Qt thread automatically.
-    # Background threads (VisionPipeline, reasoning_bridge) never
-    # call widget methods directly.
+    # ── THREAD-SAFE UI dispatch ──
     def display_to_overlay(message: InteractionMessage) -> None:
-        """Route synthesized messages to avatar UI, TTS, and actions.
-           Called from background threads but safe — uses Qt Signal emit."""
         if not message or not message.text:
             return
         animation_map = {
@@ -161,11 +130,9 @@ def main() -> None:
             InteractionEvent.ERROR: "confused",
         }
         animation = animation_map.get(message.event, "idle")
-        logger.info(f"[UI→Avatar] {message.event.value}: {message.text[:60]}")
-        # Thread-safe: use Signal emit (Qt delivers to main thread)
-        overlay.display_message_signal.emit(
-            message.text, animation, message.event.value
-        )
+        logger.info(f"[UI->Avatar] {message.event.value}: {message.text[:60]}")
+        # Emit signals — Qt delivers to main thread automatically
+        overlay.display_message_signal.emit(message.text, animation, message.event.value)
         overlay.update_state_signal.emit(animation, message.text)
 
     def on_action_approval_needed(action_name: str, request) -> None:
@@ -180,59 +147,46 @@ def main() -> None:
         action_callback=on_action_approval_needed,
     )
 
-    # ── Connect overlay signals to actual widget updates (main thread) ──
-    def _on_display_message(text: str, animation: str, event_type: str):
-        """Slot: called on main thread via Qt Signal dispatch."""
+    def _on_display_message(text, animation, event_type):
         if avatar_widget:
             avatar_widget.set_state(animation, text)
         overlay.show_message(text=text, animation=animation, event_type=event_type)
 
-    def _on_update_state(state_name: str, message_text: str):
-        """Slot: called on main thread via Qt Signal dispatch."""
+    def _on_update_state(state_name, message_text):
         if avatar_widget:
             avatar_widget.set_state(state_name, message_text)
 
     overlay.display_message_signal.connect(_on_display_message)
     overlay.update_state_signal.connect(_on_update_state)
 
-    # ── LAYER 7: Autonomy Loop (QThread — emits Qt signals) ──
     autonomy_loop = AutonomyLoop(
-        behavior_tree=behavior_tree,
-        context_manager=context_manager,
-        decision_interval=2.0,
+        behavior_tree=behavior_tree, context_manager=context_manager, decision_interval=2.0,
     )
 
     def on_decision(decision: Decision) -> None:
-        """Slot: called on main thread via Qt Signal dispatch from AutonomyLoop."""
         logger.debug(f"Decision received: {decision}")
-        # Thread-safe: use overlay's signal to update behavior state
         overlay.behavior_state_signal.emit(decision)
         if decision.decision_type == DecisionType.WANDER:
             import random
             screen = app.primaryScreen()
             if screen:
-                screen_rect = screen.availableGeometry()
-                target_x = random.randint(screen_rect.left() + 100, screen_rect.right() - 500)
-                target_y = random.randint(screen_rect.top() + 100, screen_rect.bottom() - 500)
-                overlay.wander_to(QPoint(target_x, target_y))
+                r = screen.availableGeometry()
+                tx = random.randint(r.left() + 100, r.right() - 500)
+                ty = random.randint(r.top() + 100, r.bottom() - 500)
+                overlay.wander_to(QPoint(tx, ty))
 
     autonomy_loop.decision_made.connect(on_decision)
-
-    # Connect behavior_state_signal to overlay's update method
     overlay.behavior_state_signal.connect(overlay.update_behavior_state)
 
-    # ── Show UI ──
     overlay.show()
     logger.info("Overlay visible")
 
-    # ── START PIPELINES ──
     vision_pipeline.start(capture_interval=5.0)
     logger.info("Vision pipeline started")
     autonomy_loop.start()
     logger.info("Autonomy loop started")
     interaction_handler.on_greeting(context="startup")
 
-    # ── SHUTDOWN ──
     def cleanup():
         logger.info("Shutting down...")
         vision_pipeline.stop()

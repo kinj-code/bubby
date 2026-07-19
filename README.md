@@ -48,8 +48,8 @@ All running on **~5.4 GB of RAM** on an Intel i5 processor. No cloud. No API key
 ├──────────────────────────────────────────────────────────┤
 │             ↓                                            │
 ├────────── HARDENING ────────────────────────────────────┤
-│ Profiler · Watchdog · CheckpointManager                  │
-│ 5.4 GB AI / 10.6 GB free · 100% Offline · Linux         │
+│ EventBus(IPC) · Profiler · Watchdog · CheckpointManager  │
+│ ThreadPoolExecutor(inference) · 5.4 GB AI · 100% Offline │
 └──────────────────────────────────────────────────────────┘
 ```
 
@@ -98,12 +98,12 @@ bubby/
 │   │                   #   ingestion, feedback engine, knowledge graph, synthetic gen
 │   ├── persona/        # Synthesis engine, LLM synthesis, prompts, RAG bridge
 │   ├── interaction/    # Interaction handler (UI + TTS + action routing)
-│   ├── llm/            # llama-cpp-python inference with JSON grammar constraints
+│   ├── llm/            # llama-cpp-python inference with ThreadPoolExecutor + JSON grammar
 │   ├── voice/          # Piper TTS engine
 │   ├── ui/             # Transparent Qt overlay, avatar animation engine
 │   ├── actions/        # Whitelisted system command executor (22 commands)
 │   ├── sensors/        # Terminal sensor, mobile bridge sensor
-│   ├── network/        # Local TCP bridge server for Android client
+│   ├── network/        # Local TCP bridge server + EventBus for consolidated IPC
 │   ├── integrations/   # Calendar sensor (.ics parser)
 │   ├── perf/           # Pipeline profiler, process watchdog
 │   ├── data/           # State persistence & checkpoint manager
@@ -134,20 +134,26 @@ bubby/
 
 ---
 
-## RAM Budget
+## RAM Budget (Reconciled — Item 6 Audit)
 
-| Component | RAM |
-|---|---|
-| Moondream2 VLM | 1,800 MB |
-| Sub-3B LLM (Q4_K_M) | 2,704 MB |
-| Embedding model | 300 MB |
-| Qt/Python overhead | 500 MB |
-| Piper TTS | 50 MB |
-| Avatar UI | 100 MB |
-| Feedback + Knowledge Graph | 17 MB |
-| Profiler + Watchdog + Calendar | 7 MB |
-| **TOTAL AI Stack** | **5,478 MB (5.4 GB)** |
-| **Free for OS/apps** | **10,522 MB (10.3 GB)** |
+| Component | Module(s) | RAM (MB) |
+|---|---|---|
+| Moondream2 VLM (INT8) | `src/vision/vlm_engine.py` | 1,800 |
+| Sub-3B LLM (Q4_K_M) | `src/llm/inference.py` | 2,704 |
+| Embedding model (all-MiniLM-L6) | `src/memory/embedding.py` | 300 |
+| Qt/Python overhead (PySide6 + runtime) | `src/ui/overlay.py`, `src/app.py` | 500 |
+| Piper TTS (ONNX) | `src/voice/tts_engine.py` | 50 |
+| Avatar UI (Qt widgets + animation) | `src/ui/avatar.py`, `src/ui/animation_engine.py` | 100 |
+| Vector DB (FAISS) | `src/memory/vector_db.py` | 80 |
+| Knowledge Graph (NetworkX) | `src/memory/knowledge_graph.py` | 10 |
+| Feedback DB (sqlite3) | `src/memory/feedback.py` | 5 |
+| RAG pipeline (parser + ingestion) | `src/memory/parser.py`, `src/memory/ingestion.py` | 2 |
+| Profiler + Watchdog + Calendar | `src/perf/`, `src/integrations/` | 7 |
+| Mobile Bridge (async TCP) | `src/network/local_server.py` | 5 |
+| EventBus (in-memory dict) | `src/network/event_bus.py` | <1 |
+| ThreadPoolExecutor overhead | `src/llm/inference.py` (shared) | 2 |
+| **TOTAL AI Stack** | | **~5,566 MB (5.4 GB)** |
+| **Free for OS/apps (16 GB total)** | | **~10,434 MB (10.2 GB)** |
 
 ---
 

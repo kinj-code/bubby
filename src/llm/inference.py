@@ -1,4 +1,9 @@
-"""Local LLM inference using llama-cpp-python for dynamic response generation."""
+"""Local LLM inference using llama-cpp-python for dynamic response generation.
+
+ThreadPoolExecutor offloads blocking llama-cpp calls from caller threads,
+preventing the Qt event loop and the autonomy background thread from
+stalling during generation (Item 5 punch list).
+"""
 
 import logging
 import time
@@ -6,6 +11,7 @@ import threading
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 from dataclasses import dataclass, field
+from concurrent.futures import ThreadPoolExecutor, Future
 
 from src.persona.config import PersonaConfig
 from src.persona.prompts import BUBBY_RESPONSE_JSON_SCHEMA
@@ -63,11 +69,19 @@ class LLMInference:
     Provides thread-safe, streaming-capable inference for dynamic
     response generation with persona-aware system prompts.
     
+    ThreadPoolExecutor deduplicates inference offload: all generate/
+    generate_structured calls are dispatched to a single pool, so
+    callers (UI thread, AutonomyLoop, InteractionHandler) never
+    block on llama-cpp's C-level work.
+    
     Memory footprint (Q4_K_M quantized):
     - Qwen2.5-1.5B: ~1.2 GB
     - Llama-3.2-1B: ~0.9 GB
     - Phi-3-mini: ~2.1 GB
     """
+    
+    # Single shared ThreadPoolExecutor for offloading blocking llama-cpp calls
+    _shared_executor: Optional[ThreadPoolExecutor] = None
     
     def __init__(self, config: LLMConfig) -> None:
         """
@@ -78,7 +92,7 @@ class LLMInference:
         """
         self._config = config
         self._llm = None
-        self._lock = threading.RLock()
+        self._lock = threading.RLock()  # protects self._llm (init/access)
         self._initialized = False
         self._stats = {
             "total_inferences": 0,
@@ -88,6 +102,21 @@ class LLMInference:
         }
         
         logger.info(f"LLMInference created (model: {config.model_path})")
+    
+    @classmethod
+    def _get_executor(cls) -> ThreadPoolExecutor:
+        """Get or create the shared ThreadPoolExecutor.
+        
+        Using a single shared pool ensures that blocking llama-cpp calls
+        are serialized and don't overwhelm CPU threads. Max 2 workers:
+        one for generation, one spare.
+        """
+        if cls._shared_executor is None:
+            cls._shared_executor = ThreadPoolExecutor(
+                max_workers=2,
+                thread_name_prefix="llm-inference",
+            )
+        return cls._shared_executor
     
     def initialize(self) -> bool:
         """
@@ -149,7 +178,7 @@ class LLMInference:
         stop: Optional[List[str]] = None,
     ) -> InferenceResult:
         """
-        Generate a response from the LLM.
+        Generate a response from the LLM (dispatched to ThreadPoolExecutor).
         
         Args:
             prompt: User prompt / conversation history
@@ -161,17 +190,36 @@ class LLMInference:
         Returns:
             InferenceResult with generated text and stats
         """
+        if not self._initialized:
+            if not self.initialize():
+                return InferenceResult(
+                    text="[LLM not initialized]",
+                    tokens_generated=0,
+                    generation_time_ms=0,
+                    tokens_per_second=0,
+                    stop_reason="error"
+                )
+        
+        future: Future = self._get_executor().submit(
+            self._generate_blocking,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            stop=stop,
+        )
+        return future.result()  # caller blocks on the executor's thread
+    
+    def _generate_blocking(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        stop: Optional[List[str]] = None,
+    ) -> InferenceResult:
+        """Blocking llama-cpp generation running inside ThreadPoolExecutor."""
         with self._lock:
-            if not self._initialized:
-                if not self.initialize():
-                    return InferenceResult(
-                        text="[LLM not initialized]",
-                        tokens_generated=0,
-                        generation_time_ms=0,
-                        tokens_per_second=0,
-                        stop_reason="error"
-                    )
-            
             # Build messages for chat format
             messages = []
             if system_prompt:
@@ -250,6 +298,10 @@ class LLMInference:
         """
         Generate response as a stream of tokens.
         
+        Note: Streaming runs on the caller's thread because the generator
+        protocol requires synchronous iteration. For non-streaming,
+        ThreadPoolExecutor is used.
+        
         Yields:
             Token strings as they're generated
         """
@@ -295,6 +347,8 @@ class LLMInference:
         """
         Generate a JSON-constrained structured response from the LLM.
         
+        Dispatched to ThreadPoolExecutor to avoid blocking callers.
+        
         Uses llama-cpp-python's JSON schema/grammar support to enforce
         valid JSON output. The LLM physically cannot output text outside
         the specified schema.
@@ -310,17 +364,36 @@ class LLMInference:
         Returns:
             InferenceResult with generated text (JSON string)
         """
+        if not self._initialized:
+            if not self.initialize():
+                return InferenceResult(
+                    text='{"animation": "idle", "speech": ""}',
+                    tokens_generated=0,
+                    generation_time_ms=0,
+                    tokens_per_second=0,
+                    stop_reason="error"
+                )
+        
+        future: Future = self._get_executor().submit(
+            self._generate_structured_blocking,
+            prompt=prompt,
+            system_prompt=system_prompt,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            json_schema=json_schema,
+        )
+        return future.result()
+    
+    def _generate_structured_blocking(
+        self,
+        prompt: str,
+        system_prompt: str = "",
+        max_tokens: Optional[int] = None,
+        temperature: Optional[float] = None,
+        json_schema: Optional[dict] = None,
+    ) -> InferenceResult:
+        """Blocking structured generation inside ThreadPoolExecutor."""
         with self._lock:
-            if not self._initialized:
-                if not self.initialize():
-                    return InferenceResult(
-                        text='{"animation": "idle", "speech": ""}',
-                        tokens_generated=0,
-                        generation_time_ms=0,
-                        tokens_per_second=0,
-                        stop_reason="error"
-                    )
-            
             # Use default schema if none provided
             schema = json_schema or BUBBY_RESPONSE_JSON_SCHEMA
             
@@ -444,6 +517,13 @@ class LLMInference:
         """Check if LLM is initialized and ready."""
         return self._initialized and self._llm is not None
     
+    @classmethod
+    def shutdown_executor(cls) -> None:
+        """Shut down the shared ThreadPoolExecutor."""
+        if cls._shared_executor is not None:
+            cls._shared_executor.shutdown(wait=True, cancel_futures=False)
+            cls._shared_executor = None
+    
     def shutdown(self) -> None:
         """Clean up resources."""
         with self._lock:
@@ -478,7 +558,7 @@ if __name__ == "__main__":
     if llm.initialize():
         logger.info("✓ Model initialized")
         
-        # Test generation
+        # Test generation (offloaded via ThreadPoolExecutor)
         result = llm.generate(
             prompt="Hello! What are you?",
             system_prompt="You are Bubby, a friendly desktop companion.",
@@ -502,3 +582,5 @@ if __name__ == "__main__":
     else:
         logger.warning("Model not found - skipping inference test")
         logger.info("Run scripts/download_llm.py to download a model")
+    
+    LLMInference.shutdown_executor()

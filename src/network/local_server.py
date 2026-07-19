@@ -60,14 +60,14 @@ class LocalBridgeServer:
     
     Listens on a configurable local port for JSON-line payloads.
     Each connection is handled asynchronously. Events are dispatched
-    to registered callbacks for sensor integration.
+    to registered callbacks and optionally to the EventBus.
     
     Architecture:
     1. Server starts in background thread
     2. Android client connects via TCP socket
     3. Client sends JSON payloads (one per line)
-    4. Server parses, normalizes, dispatches to MobileSensor
-    5. MobileSensor feeds ProactivityEvaluator
+    4. Server parses, normalizes, dispatches via EventBus + callbacks
+    5. MobileSensor subscribes to EventBus for consolidated IPC
     """
 
     DEFAULT_HOST = "0.0.0.0"  # Listen on all interfaces (local network only)
@@ -90,8 +90,23 @@ class LocalBridgeServer:
         self._connected_clients = 0
         self._events_received = 0
         self._auth_failures = 0
+        # EventBus integration (Item 4 punch list)
+        self._event_bus = None
+        self._event_bus_topic = ""
         
         logger.info(f"LocalBridgeServer configured: {host}:{port} (auth={'on' if self._auth_enabled else 'off'})")
+
+    def set_event_bus(self, bus) -> None:
+        """Attach an EventBus for consolidated IPC (Item 4 punch list).
+        
+        Once attached, every parsed MobileEvent is also published to
+        the bus on TOPIC_MOBILE_EVENT alongside legacy callbacks.
+        Set before calling start().
+        """
+        from src.network.event_bus import TOPIC_MOBILE_EVENT
+        self._event_bus = bus
+        self._event_bus_topic = TOPIC_MOBILE_EVENT
+        logger.info("LocalBridgeServer attached to EventBus")
 
     def register_callback(self, callback: Callable[[MobileEvent], None]) -> None:
         """Register a callback for incoming mobile events."""
@@ -198,6 +213,14 @@ class LocalBridgeServer:
                             f"(battery={event.device_battery}%, app={event.active_app or 'none'})"
                         )
                         
+                        # Dispatch via EventBus (consolidated IPC)
+                        if self._event_bus and self._event_bus_topic:
+                            try:
+                                self._event_bus.publish(self._event_bus_topic, event)
+                            except Exception as e:
+                                logger.error(f"EventBus publish error: {e}")
+                        
+                        # Legacy callbacks
                         for callback in self._callbacks:
                             try:
                                 callback(event)
@@ -337,6 +360,13 @@ if __name__ == "__main__":
     logger.info("=" * 60)
     
     server = LocalBridgeServer(host="127.0.0.1", port=19877)
+    
+    # Test EventBus integration
+    from src.network.event_bus import EventBus, TOPIC_MOBILE_EVENT
+    bus = EventBus()
+    bus_events = []
+    bus.subscribe(TOPIC_MOBILE_EVENT, lambda e: bus_events.append(e))
+    server.set_event_bus(bus)
     
     events_received = []
     def on_event(event: MobileEvent):

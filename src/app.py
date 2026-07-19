@@ -23,6 +23,7 @@ except ImportError:
 
 import logging
 import sys
+from pathlib import Path
 from typing import Optional
 
 # Force X11 platform before PySide6 imports to avoid
@@ -30,11 +31,12 @@ from typing import Optional
 if not os.environ.get("QT_QPA_PLATFORM"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QMessageBox, QFileDialog
 from PySide6.QtCore import QTimer, QPoint
 
 from src.ui.overlay import OverlayWindow
 from src.ui.avatar import AvatarWidget, AvatarConfig
+from src.ui.settings_window import SettingsWindow
 from src.brain.decisions import DecisionType, Decision
 from src.brain.behavior_tree import (
     BehaviorTree, Selector, Sequence, Condition, Action
@@ -224,6 +226,12 @@ def main() -> None:
 
     overlay.user_message_submitted.connect(_on_user_message)
 
+    # ── Settings button ──────────────────────────────────────────
+    def _open_settings() -> None:
+        dlg = SettingsWindow(overlay)
+        dlg.exec()
+    overlay.settings_requested.connect(_open_settings)
+
     autonomy_loop = AutonomyLoop(
         behavior_tree=behavior_tree, context_manager=context_manager, decision_interval=2.0,
     )
@@ -245,6 +253,53 @@ def main() -> None:
 
     overlay.show()
     logger.info("Overlay visible")
+
+    # ── First-time setup wizard ──────────────────────────────────
+    llm_path = os.environ.get("BUBBY_LLM_PATH", "").strip()
+    if not llm_path or not Path(os.path.abspath(llm_path)).exists():
+        logger.info("No LLM model configured — showing setup wizard")
+        QMessageBox.information(
+            overlay,
+            "Welcome to Bubby! 🫧",
+            (
+                "Welcome to Bubby — your friendly desktop companion slime!\n\n"
+                "Before we begin, please select your local LLM model (.gguf file).\n"
+                "This will let Bubby talk to you naturally.\n\n"
+                "If you don't have one yet, you can download one from:\n"
+                "  https://huggingface.co/models?search=GGUF\n\n"
+                "Click OK to select your model file."
+            ),
+        )
+        path, _ = QFileDialog.getOpenFileName(
+            overlay,
+            "Select GGUF Model File",
+            str(Path(__file__).parent.parent / "models" / "llm"),
+            "GGUF Models (*.gguf);;All Files (*)",
+        )
+        if path:
+            # Save to .env
+            env_path = Path(__file__).parent.parent / ".env"
+            lines = env_path.read_text().splitlines() if env_path.exists() else []
+            found = False
+            new_lines = []
+            for line in lines:
+                if line.startswith("BUBBY_LLM_PATH="):
+                    new_lines.append(f"BUBBY_LLM_PATH={path}")
+                    found = True
+                else:
+                    new_lines.append(line)
+            if not found:
+                new_lines.append(f"BUBBY_LLM_PATH={path}")
+            env_path.write_text("\n".join(new_lines) + "\n")
+            os.environ["BUBBY_LLM_PATH"] = path
+            logger.info(f"User selected model: {path}")
+            QMessageBox.information(
+                overlay,
+                "Model Saved!",
+                f"✅ LLM model configured!\n\nRestart Bubby to start chatting.\n\nModel: {path}",
+            )
+        else:
+            logger.info("User skipped model selection — template mode only")
 
     vision_pipeline.start(capture_interval=5.0)
     logger.info("Vision pipeline started")

@@ -164,6 +164,8 @@ class OverlayWindow(QWidget):
     user_poked = Signal()
     # Emitted when user types a message and presses Enter in the input box
     user_message_submitted = Signal(str)
+    # Emitted when user clicks the settings (gear) button
+    settings_requested = Signal()
 
     CLOSE_ZONE_SIZE = 24
     CLOSE_ZONE_COLOR = QColor(255, 59, 48, 180)
@@ -209,6 +211,7 @@ class OverlayWindow(QWidget):
 
         self._setup_window()
         self._setup_input_box()
+        self._setup_settings_button()
         self._setup_close_zone_timer()
 
         # Start default animation
@@ -229,6 +232,29 @@ class OverlayWindow(QWidget):
         self.set_click_through(self._click_through)
         self.setFixedSize(*self._window_size)
         self.setMouseTracking(True)
+
+    def _setup_settings_button(self) -> None:
+        """Add a small gear icon button for settings."""
+        self._settings_btn = QLabel("⚙", self)
+        self._settings_btn.setStyleSheet("""
+            QLabel {
+                color: rgba(200, 200, 220, 160);
+                font-size: 16px;
+                background: rgba(0, 0, 0, 40);
+                border-radius: 10px;
+                padding: 2px 6px;
+            }
+            QLabel:hover {
+                color: rgba(255, 255, 255, 220);
+                background: rgba(60, 60, 80, 140);
+            }
+        """)
+        self._settings_btn.setFixedSize(24, 24)
+        # Position next to the close zone (bottom-right corner, left of close)
+        w, h = self._window_size
+        self._settings_btn.move(w - self.CLOSE_ZONE_SIZE - 28, h - self.CLOSE_ZONE_SIZE - 2)
+        self._settings_btn.mousePressEvent = lambda e: self.settings_requested.emit()
+        self._settings_btn.show()
 
     def _setup_input_box(self) -> None:
         """Create a text input box for chatting with Bubby."""

@@ -103,11 +103,13 @@ impl KeyManager {
     /// The `app` string is used as the keychain entry description.
     /// On Linux this requires a running D-Bus session bus and
     /// `gnome-keyring` or `kwallet`.
-    pub fn new(app: &str) -> Result<Self, String> {
+    pub fn new(_app: &str) -> Result<Self, String> {
         let entry = Entry::new(KEYRING_SERVICE, KEYRING_ACCOUNT)
             .map_err(|e| format!("keychain init failed: {}", e))?;
-        // Set a human-readable label on the stored secret
-        let _ = entry.set_password(app);
+        // Do NOT call entry.set_password() here — that would overwrite
+        // the stored encryption key with the app name string, making the
+        // key unrecoverable across restarts. The first call to
+        // get_or_create_key() handles first-run key generation + storage.
         Ok(Self { entry })
     }
 

@@ -1,0 +1,31 @@
+[package]
+name = "bubby-core"
+version = "0.2.0"
+edition = "2021"
+description = "Rust core kernel for Bubby — deterministic memory, vector search, IPC bridge"
+
+[lib]
+name = "bubby_core"
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+rusqlite = { version = "0.31", features = ["bundled", "vtab"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+numpy = "0.22"
+pyo3 = { version = "0.22", features = ["extension-module"] }
+rand = "0.8"
+parking_lot = "0.12"
+crossbeam = "0.8"
+tracing = "0.1"
+tracing-subscriber = "0.3"
+anyhow = "1"
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+opt-level = 3
+lto = true
+codegen-units = 1
+strip = true

@@ -32,6 +32,10 @@ class OverlayWindow(QWidget):
     drag_started = Signal(QPoint)
     drag_finished = Signal(QPoint)
     click_through_changed = Signal(bool)
+    # Thread-safe UI update from any thread
+    display_message_signal = Signal(str, str, str)  # text, animation, event_type
+    update_state_signal = Signal(str, str)           # state_name, message_text
+    behavior_state_signal = Signal(object)            # Decision object
     
     # Close zone configuration
     CLOSE_ZONE_SIZE = 80

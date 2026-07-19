@@ -2,24 +2,29 @@
 
 Architecture (decoupled):
 ┌─────────────────────────────────────────────────────┐
-│  AutonomyLoop (background thread)                   │
+│  AutonomyLoop (Qt QThread)                          │
 │    → decision_made Signal → on_decision()           │
-│    (only for non-verbal UI state: animations,       │
-│     wandering, etc.)                                │
+│    (thread-safe: emitted from worker, slot on main) │
 ├─────────────────────────────────────────────────────┤
 │  Vision Pipeline → Reasoning → Synthesis            │
 │    → InteractionHandler.display_callback            │
+│    → OverlayWindow.display_message_signal (main thd)│
 │    → AvatarWidget.set_state() + TTS + Actions       │
-│    (for verbal/text output: observations,           │
-│     greetings, responses + voice + system commands) │
 └─────────────────────────────────────────────────────┘
-PHASE 8: Omni-Integration — Avatar UI + TTS Voice + System Agency
+
+All widget mutations go through Qt Signal/Slot — zero direct
+calls from background threads to UI objects.
 """
 
 import logging
-import sys
 import os
+import sys
 from typing import Optional
+
+# Force X11 platform before PySide6 imports to avoid
+# Wayland segfaults on headless/XWayland desktops.
+if not os.environ.get("QT_QPA_PLATFORM"):
+    os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from PySide6.QtWidgets import QApplication
 from PySide6.QtCore import QTimer
@@ -39,61 +44,50 @@ from src.memory.long_term_memory import LongTermMemory
 from src.persona.config import PersonaConfig, PersonaType
 from src.persona.llm_synthesis import LLMSynthesisEngine, LLMSynthesisConfig
 from src.interaction.handler import InteractionHandler, InteractionMessage, InteractionEvent
-from src.llm.inference import LLMInference, LLMConfig
-from src.llm.model_manager import ModelManager
-from src.voice.tts_engine import TTSEngine, TTSConfig
 from src.actions.executor import SystemExecutor
+from src.voice.tts_engine import TTSEngine, TTSConfig
 
-# Configure logging
-logging.basicConfig(
-    level=logging.INFO,
-    format="%(asctime)s | %(levelname)-8s | %(name)s | %(message)s"
-)
 logger = logging.getLogger(__name__)
 
-# Environment variables
 USE_LLM = os.environ.get("BUBBY_USE_LLM", "1") == "1"
-USE_TTS = os.environ.get("BUBBY_USE_TTS", "1") == "1"
+USE_TTS = os.environ.get("BUBBY_USE_TTS", "0") == "1"
 
 
 def create_behavior_tree() -> BehaviorTree:
-    """Create the behavior tree for autonomous decision-making. Returns BehaviorTree instance."""
+    """Create the behavior tree for autonomous decision-making."""
     def idle_action(context):
-        logger.info("Action: Idle")
         return DecisionType.IDLE
     def wander_action(context):
-        logger.info("Action: Wander")
         return DecisionType.WANDER
     def sit_action(context):
-        logger.info("Action: Sit")
         return DecisionType.SIT
     def user_present(context):
         return context.user_present
     def idle_time_check(context):
         return context.user_idle_time > 5.0
 
-    user_present_cond = Condition("User Present?", user_present)
-    idle_action_node = Action("Idle", idle_action)
     idle_sequence = Sequence("Idle Sequence")
-    idle_sequence.add_child(user_present_cond)
-    idle_sequence.add_child(idle_action_node)
-    idle_time_cond = Condition("Idle > 5s?", idle_time_check)
-    wander_action_node = Action("Wander", wander_action)
+    idle_sequence.add_child(Condition("User Present?", user_present))
+    idle_sequence.add_child(Action("Idle", idle_action))
     wander_sequence = Sequence("Wander Sequence")
-    wander_sequence.add_child(idle_time_cond)
-    wander_sequence.add_child(wander_action_node)
-    sit_action_node = Action("Sit", sit_action)
+    wander_sequence.add_child(Condition("Idle > 5s?", idle_time_check))
+    wander_sequence.add_child(Action("Wander", wander_action))
     root = Selector("Root")
     root.add_child(idle_sequence)
     root.add_child(wander_sequence)
-    root.add_child(sit_action_node)
+    root.add_child(Action("Sit", sit_action))
     return BehaviorTree(root)
 
 
 def main() -> None:
-    """Main application entry point with omni-integration architecture."""
+    """Initialize and launch the Bubby desktop companion."""
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
+    )
+
     logger.info("=" * 60)
-    logger.info("BUBBY - Autonomous Desktop Companion (Phase 8: Omni)")
+    logger.info("BUBBY DESKTOP COMPANION — Starting")
     logger.info("=" * 60)
 
     app = QApplication(sys.argv)
@@ -139,9 +133,24 @@ def main() -> None:
     system_executor = SystemExecutor()
     logger.info(f"System executor ready: {len(system_executor.get_available_actions())} actions")
 
-    # ── LAYER 6: Interaction Handler (verbal/text/voice/action bridge) ──
+    # ── LAYER 1.5: Avatar Widget (inside overlay) ──
+    avatar_config = AvatarConfig(
+        show_emotes=True, show_text=True, emote_size=64, bob_animation=True,
+    )
+    avatar_widget = AvatarWidget(parent=overlay, config=avatar_config)
+    avatar_widget.set_state("idle")
+    overlay.set_animation_widget(avatar_widget)
+    logger.info("Avatar widget embedded in overlay")
+
+    # ── LAYER 6: Interaction Handler ──
+    #
+    # THREAD-SAFETY: display_callback emits overlay signals which
+    # are dispatched on the main Qt thread automatically.
+    # Background threads (VisionPipeline, reasoning_bridge) never
+    # call widget methods directly.
     def display_to_overlay(message: InteractionMessage) -> None:
-        """Route synthesized messages to avatar UI, TTS, and actions."""
+        """Route synthesized messages to avatar UI, TTS, and actions.
+           Called from background threads but safe — uses Qt Signal emit."""
         if not message or not message.text:
             return
         animation_map = {
@@ -153,18 +162,15 @@ def main() -> None:
         }
         animation = animation_map.get(message.event, "idle")
         logger.info(f"[UI→Avatar] {message.event.value}: {message.text[:60]}")
-        if avatar_widget:
-            avatar_widget.set_state(animation, message.text)
-        overlay.show_message(
-            text=message.text,
-            animation=animation,
-            event_type=message.event.value,
+        # Thread-safe: use Signal emit (Qt delivers to main thread)
+        overlay.display_message_signal.emit(
+            message.text, animation, message.event.value
         )
+        overlay.update_state_signal.emit(animation, message.text)
 
     def on_action_approval_needed(action_name: str, request) -> None:
         logger.info(f"ACTION APPROVAL NEEDED: {action_name}")
-        if avatar_widget:
-            avatar_widget.set_state("think", f"May I {action_name}?")
+        overlay.update_state_signal.emit("think", f"May I {action_name}?")
 
     interaction_handler = InteractionHandler(
         synthesis_engine=synthesis_engine,
@@ -174,16 +180,22 @@ def main() -> None:
         action_callback=on_action_approval_needed,
     )
 
-    # ── LAYER 1.5: Avatar Widget (inside overlay) ──
-    avatar_config = AvatarConfig(
-        show_emotes=True, show_text=True, emote_size=64, bob_animation=True,
-    )
-    avatar_widget = AvatarWidget(parent=overlay, config=avatar_config)
-    avatar_widget.set_state("idle")
-    overlay.set_animation_widget(avatar_widget)
-    logger.info("Avatar widget embedded in overlay")
+    # ── Connect overlay signals to actual widget updates (main thread) ──
+    def _on_display_message(text: str, animation: str, event_type: str):
+        """Slot: called on main thread via Qt Signal dispatch."""
+        if avatar_widget:
+            avatar_widget.set_state(animation, text)
+        overlay.show_message(text=text, animation=animation, event_type=event_type)
 
-    # ── LAYER 7: Autonomy Loop ──
+    def _on_update_state(state_name: str, message_text: str):
+        """Slot: called on main thread via Qt Signal dispatch."""
+        if avatar_widget:
+            avatar_widget.set_state(state_name, message_text)
+
+    overlay.display_message_signal.connect(_on_display_message)
+    overlay.update_state_signal.connect(_on_update_state)
+
+    # ── LAYER 7: Autonomy Loop (QThread — emits Qt signals) ──
     autonomy_loop = AutonomyLoop(
         behavior_tree=behavior_tree,
         context_manager=context_manager,
@@ -191,52 +203,29 @@ def main() -> None:
     )
 
     def on_decision(decision: Decision) -> None:
+        """Slot: called on main thread via Qt Signal dispatch from AutonomyLoop."""
         logger.debug(f"Decision received: {decision}")
-        overlay.update_behavior_state(decision)
+        # Thread-safe: use overlay's signal to update behavior state
+        overlay.behavior_state_signal.emit(decision)
         if decision.decision_type == DecisionType.WANDER:
             import random
             screen = app.primaryScreen()
             if screen:
                 screen_rect = screen.availableGeometry()
-                margin = 100
-                target_x = random.randint(
-                    screen_rect.left() + margin,
-                    screen_rect.right() - margin - 400
-                )
-                target_y = random.randint(
-                    screen_rect.top() + margin,
-                    screen_rect.bottom() - margin - 400
-                )
-                decision.params["target_x"] = target_x
-                decision.params["target_y"] = target_y
-                overlay.wander_to(target_x, target_y)
+                target_x = random.randint(screen_rect.left() + 100, screen_rect.right() - 500)
+                target_y = random.randint(screen_rect.top() + 100, screen_rect.bottom() - 500)
+                overlay.wander_to(QPoint(target_x, target_y))
 
     autonomy_loop.decision_made.connect(on_decision)
 
-    # ── VISION → REASONING → SYNTHESIS → INTERACTION pipeline ──
-    def on_vision_observation(observation_text: str, confidence: float, metadata: dict) -> None:
-        memory_buffer.add_observation(description=observation_text, metadata=metadata)
-        context_summary = memory_buffer.get_context_window(max_tokens=500)
-        from src.brain.decisions import ScreenContext
-        screen_context = ScreenContext(
-            user_present=context_manager.user_present,
-            user_idle_time=context_manager.user_idle_time,
-            content_type=metadata.get("content_type", "unknown"),
-            content_confidence=confidence,
-        )
-        reasoning = reasoning_bridge.reason(screen_context)
-        if reasoning:
-            msg = interaction_handler.on_observation(reasoning, context_text=context_summary)
-            if msg.text:
-                logger.debug(f"Observation: {msg.text[:50]}...")
-            else:
-                logger.debug("Observation suppressed by Interaction Budget")
+    # Connect behavior_state_signal to overlay's update method
+    overlay.behavior_state_signal.connect(overlay.update_behavior_state)
 
-    vision_pipeline.set_callback(on_vision_observation)
-
-    # ── STARTUP ──
+    # ── Show UI ──
     overlay.show()
-    logger.info("Overlay window shown")
+    logger.info("Overlay visible")
+
+    # ── START PIPELINES ──
     vision_pipeline.start(capture_interval=5.0)
     logger.info("Vision pipeline started")
     autonomy_loop.start()

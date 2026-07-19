@@ -56,7 +56,8 @@ impl HnswIndex {
         assert_eq!(embedding.len(), self.dimension);
 
         let normalized = Self::normalize(embedding);
-        let level = Self::random_level(self.m);
+        // Every node must participate in layer 0; level >= 0
+        let level = Self::random_level(self.m).max(0);
 
         self.nodes.insert(
             id,
@@ -71,70 +72,105 @@ impl HnswIndex {
             self.graph.push(HashMap::new());
         }
 
-        // Add node to relevant layers
+        // Add node to layers 0..=level
         for lc in 0..=level {
-            self.graph[lc as usize].entry(id).or_insert_with(Vec::new);
+            self.graph[lc as usize]
+                .entry(id)
+                .or_insert_with(Vec::new);
         }
 
-        // Find neighbors and connect (simplified — greedy search at each layer)
+        // First node — become the entry point, no neighbors to connect
         if self.entry_point.is_none() {
             self.entry_point = Some(id);
             self.max_layer = level;
             return;
         }
 
-        let mut ep = self.entry_point.unwrap();
-        let mut ep_level = self.max_layer;
+        let ep0 = self.entry_point.unwrap();
+        let mut ep = ep0;
 
-        // Traverse down from top layer to level+1
-        for lc in (level + 1..=self.max_layer as usize).rev() {
+        // Greedy descent from top layer down to level+1
+        for lc in ((level + 1)..=self.max_layer).rev() {
             let layer = lc as usize;
-            if let Some(neighbors) = self.graph.get(layer).and_then(|g| g.get(&ep)) {
-                let mut best = ep;
-                let mut best_dist = self.distance(id, best);
-                for &n in neighbors {
-                    let d = self.distance(id, n);
-                    if d < best_dist {
-                        best_dist = d;
-                        best = n;
+            let mut best = ep;
+            let mut best_dist = self.distance(id, best);
+            let mut visited_local: HashMap<i64, bool> = HashMap::new();
+            visited_local.insert(ep, true);
+            loop {
+                let mut improved = false;
+                if let Some(layer_graph) = self.graph.get(layer) {
+                    if let Some(neighbors) = layer_graph.get(&best) {
+                        for &n in neighbors {
+                            if visited_local.contains_key(&n) {
+                                continue;
+                            }
+                            visited_local.insert(n, true);
+                            let d = self.distance(id, n);
+                            if d < best_dist {
+                                best_dist = d;
+                                best = n;
+                                improved = true;
+                            }
+                        }
                     }
                 }
-                ep = best;
+                if !improved {
+                    break;
+                }
             }
-            ep_level = lc as isize;
+            ep = best;
         }
 
-        // Connect at layers 0..=level
-        for lc in (0..=usize::min(level as usize, self.max_layer as usize)).rev() {
-            if let Some(layer_graph) = self.graph.get_mut(lc) {
-                // Find M nearest neighbors in this layer
-                let candidates = if let Some(entries) = layer_graph.get(&ep) {
-                    let mut dists: Vec<(f64, i64)> = entries
-                        .iter()
-                        .map(|&n| (self.distance(id, n), n))
-                        .collect();
-                    dists.sort_by(|a, b| a.0.partial_cmp(&b.0).unwrap());
-                    dists.iter().map(|&(_, n)| n).take(self.m).collect::<Vec<_>>()
-                } else {
-                    vec![ep]
-                };
+        // Connect at each layer from level down to 0
+        for lc in (0..=level).rev() {
+            let layer = lc as usize;
 
-                // Bidirectional connections
-                for &neighbor in &candidates {
-                    layer_graph.entry(id).or_insert_with(Vec::new).push(neighbor);
+            // Select M nearest neighbors among existing nodes in this layer
+            let candidate_ids: Vec<i64> = {
+                // Collect all existing nodes EXCEPT the new node itself
+                let mut ids: Vec<i64> = self.graph
+                    .get(layer)
+                    .map(|g| g.keys().copied().filter(|k| *k != id).collect())
+                    .unwrap_or_default();
+                if ids.is_empty() {
+                    // No other nodes in this layer yet
+                    vec![]
+                } else {
+                    // Sort by distance ascending, take top M
+                    ids.sort_by(|a, b| {
+                        self.distance(id, *a)
+                            .partial_cmp(&self.distance(id, *b))
+                            .unwrap()
+                    });
+                    ids.truncate(self.m);
+                    ids
+                }
+            };
+
+            if let Some(layer_graph) = self.graph.get_mut(layer) {
+                for &neighbor in &candidate_ids {
+                    layer_graph
+                        .get_mut(&id)
+                        .expect("new node must be in layer")
+                        .push(neighbor);
                     layer_graph
                         .entry(neighbor)
                         .or_insert_with(Vec::new)
                         .push(id);
+                }
 
-                    // Prune excess connections
-                    if let Some(neighbors) = layer_graph.get_mut(&neighbor) {
-                        neighbors.sort();
-                        neighbors.dedup();
-                        if neighbors.len() > self.m {
-                            neighbors.truncate(self.m);
-                        }
+                // Prune excess connections for all affected nodes
+                for &neighbor in &candidate_ids {
+                    if let Some(nbrs) = layer_graph.get_mut(&neighbor) {
+                        nbrs.sort();
+                        nbrs.dedup();
+                        nbrs.truncate(self.m);
                     }
+                }
+                if let Some(nbrs) = layer_graph.get_mut(&id) {
+                    nbrs.sort();
+                    nbrs.dedup();
+                    nbrs.truncate(self.m);
                 }
             }
         }

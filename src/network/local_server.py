@@ -77,17 +77,21 @@ class LocalBridgeServer:
         self,
         host: str = DEFAULT_HOST,
         port: int = DEFAULT_PORT,
+        shared_secret: str = "",
     ) -> None:
         self._host = host
         self._port = port
+        self._shared_secret = shared_secret
+        self._auth_enabled = bool(shared_secret)
         self._server: Optional[asyncio.AbstractServer] = None
         self._running = False
         self._thread: Optional[threading.Thread] = None
         self._callbacks: List[Callable[[MobileEvent], None]] = []
         self._connected_clients = 0
         self._events_received = 0
+        self._auth_failures = 0
         
-        logger.info(f"LocalBridgeServer configured: {host}:{port}")
+        logger.info(f"LocalBridgeServer configured: {host}:{port} (auth={'on' if self._auth_enabled else 'off'})")
 
     def register_callback(self, callback: Callable[[MobileEvent], None]) -> None:
         """Register a callback for incoming mobile events."""
@@ -146,27 +150,45 @@ class LocalBridgeServer:
         reader: asyncio.StreamReader,
         writer: asyncio.StreamWriter,
     ) -> None:
-        """Handle a connected mobile client."""
+        """Handle a connected mobile client with optional shared-secret auth."""
         addr = writer.get_extra_info('peername')
+        
+        # ── Shared-secret authentication handshake ──
+        if self._auth_enabled:
+            try:
+                auth_line = await asyncio.wait_for(reader.readline(), timeout=5.0)
+                auth_data = json.loads(auth_line.decode('utf-8').strip())
+                presented_secret = auth_data.get("auth", "")
+                if presented_secret != self._shared_secret:
+                    self._auth_failures += 1
+                    logger.warning(f"Auth rejected for {addr}: bad secret (failure #{self._auth_failures})")
+                    writer.write(b'{"status": "error", "reason": "unauthorized"}\n')
+                    await writer.drain()
+                    writer.close()
+                    return
+            except (asyncio.TimeoutError, json.JSONDecodeError, Exception):
+                self._auth_failures += 1
+                logger.warning(f"Auth failed for {addr}: no valid auth token (failure #{self._auth_failures})")
+                writer.write(b'{"status": "error", "reason": "unauthorized"}\n')
+                await writer.drain()
+                writer.close()
+                return
+        
         self._connected_clients += 1
         logger.info(f"Mobile client connected: {addr} (total: {self._connected_clients})")
         
         try:
             while self._running:
-                # Read a line (JSON payload)
                 data = await reader.readline()
                 if not data:
-                    break  # Client disconnected
+                    break
                 
                 try:
                     line = data.decode('utf-8').strip()
                     if not line:
                         continue
                     
-                    # Parse JSON payload
                     payload = json.loads(line)
-                    
-                    # Normalize into MobileEvent
                     event = self._parse_event(payload)
                     
                     if event:
@@ -176,14 +198,12 @@ class LocalBridgeServer:
                             f"(battery={event.device_battery}%, app={event.active_app or 'none'})"
                         )
                         
-                        # Dispatch to callbacks
                         for callback in self._callbacks:
                             try:
                                 callback(event)
                             except Exception as e:
                                 logger.error(f"Callback error: {e}")
                         
-                        # Send acknowledgment
                         ack = json.dumps({"status": "ok", "event_id": self._events_received})
                         writer.write((ack + "\n").encode('utf-8'))
                         await writer.drain()
@@ -219,11 +239,12 @@ class LocalBridgeServer:
             "message": "Battery at 14%"
         }
         """
-        event_type_str = payload.get("type", "custom")
+        event_type_str = payload.get("type", "")
         try:
             event_type = MobileEventType(event_type_str)
         except ValueError:
-            event_type = MobileEventType.CUSTOM
+            logger.warning(f"Rejected unknown event type: '{event_type_str}'")
+            return None
         
         event = MobileEvent(
             event_type=event_type,
@@ -299,6 +320,8 @@ The Kotlin service code is in: mobile/OfflineBridgeService.kt
             "port": self._port,
             "connected_clients": self._connected_clients,
             "events_received": self._events_received,
+            "auth_enabled": self._auth_enabled,
+            "auth_failures": self._auth_failures,
         }
 
 

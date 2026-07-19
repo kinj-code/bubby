@@ -265,6 +265,12 @@ class LLMSynthesisEngine:
         )
         
         def _run():
+            # If LLM is not initialized, fallback immediately (no warning spam)
+            if not self._llm_inference or not self._llm_inference.is_ready():
+                self._stats["template_responses"] += 1
+                callback(template_response)
+                return
+            
             try:
                 # Use plain text generation (no JSON schema — avoids timeout issues)
                 result = self._llm_inference.generate(

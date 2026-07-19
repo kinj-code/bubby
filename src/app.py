@@ -15,8 +15,11 @@ faulthandler.enable()
 faulthandler.register(signal.SIGUSR1, all_threads=True)
 
 # ── Load .env before ANY other imports ───────────────────────────
-from dotenv import load_dotenv
-load_dotenv()
+try:
+    from dotenv import load_dotenv
+    load_dotenv()
+except ImportError:
+    pass
 
 import logging
 import sys

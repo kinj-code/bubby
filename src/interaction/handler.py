@@ -2,7 +2,10 @@
 Interaction handler: Bridges synthesis output to user display.
 
 Connects the SynthesisEngine (persona-driven responses) to the
-UI/teminal so the user actually "hears" from the companion.
+UI/terminal so the user actually "hears" from the companion.
+
+Validation pipeline (after audit remediation):
+  synthesis → CognitiveCritic.review() → ActionPolicy.check() → display/action
 """
 
 import logging
@@ -13,6 +16,7 @@ from enum import Enum
 
 from src.persona.synthesis import SynthesisEngine, SynthesizedResponse
 from src.persona.config import PersonaConfig
+from src.actions.policy import ActionSource
 
 logger = logging.getLogger(__name__)
 
@@ -96,42 +100,50 @@ class InteractionHandler:
         tts_engine: Optional[Any] = None,
         action_executor: Optional[Any] = None,
         action_callback: Optional[Callable[[str, Any], None]] = None,
+        cognitive_critic: Optional[Any] = None,
+        action_policy: Optional[Any] = None,
     ) -> None:
         """
         Initialize interaction handler.
-        
+
         Args:
             synthesis_engine: Engine for generating responses
             display_callback: Function to call with display messages
             tts_engine: Optional TTSEngine for speech synthesis
             action_executor: Optional SystemExecutor for system commands
             action_callback: Optional callback for actions requiring approval
+            cognitive_critic: Optional CognitiveCritic for validation (groundedness, provenance)
+            action_policy: Optional ActionPolicy for provenance-based action gating
         """
         self._engine = synthesis_engine
         self._display_callback = display_callback
         self._tts_engine = tts_engine
         self._action_executor = action_executor
         self._action_callback = action_callback
-        
+        self._critic = cognitive_critic
+        self._action_policy = action_policy
+
         # Message history
         self._messages: list[InteractionMessage] = []
         self._max_history = 50
-        
+
         # State tracking
         self._last_greeting_time: Optional[float] = None
         self._greeting_cooldown = self.GREETING_COOLDOWN
-        
+
         # Interaction Budget: State-change anti-spam
         self._last_interaction_time: Optional[float] = None
         self._state_change_cooldown = self.STATE_CHANGE_COOLDOWN
         self._last_content_type: Optional[str] = None  # Track context shifts
-        
+
         logger.info(
             f"InteractionHandler initialized "
             f"(greeting_cd={self._greeting_cooldown}s, "
             f"state_change_cd={self._state_change_cooldown}s, "
             f"tts={'enabled' if tts_engine else 'disabled'}, "
-            f"actions={'enabled' if action_executor else 'disabled'})"
+            f"actions={'enabled' if action_executor else 'disabled'}, "
+            f"critic={'enabled' if cognitive_critic else 'disabled'}, "
+            f"policy={'enabled' if action_policy else 'disabled'})"
         )
     
     def on_observation(
@@ -185,19 +197,32 @@ class InteractionHandler:
             context_text=context_text,
             trigger_type="observation"
         )
-        
+
+        # ── Run response through cognitive critic ──
+        response_dict = {
+            "animation": response.animation,
+            "speech": response.text,
+            "action": getattr(response, 'action', '') or '',
+        }
+        if self._critic:
+            # Autonomous observation source
+            self._critic.set_rag_context([], source=ActionSource.AUTONOMOUS_OBSERVATION.value)
+            verdict = self._critic.review(response_dict)
+            response_dict = verdict.corrected_output
+            self._critic.clear_rag_context()
+
         # Create message
         message = InteractionMessage(
-            text=response.text,
+            text=response_dict.get("speech", ""),
             event=InteractionEvent.OBSERVATION,
-            animation=response.animation,
+            animation=response_dict.get("animation", "idle"),
             source="synthesis"
         )
-        
+
         # Update interaction budget tracker
         self._last_content_type = content_type
         self._last_interaction_time = time.time()
-        
+
         self._add_message(message)
         return message
     
@@ -257,14 +282,27 @@ class InteractionHandler:
             context_text=user_text,
             trigger_type="user_input"
         )
-        
+
+        # ── Run response through cognitive critic ──
+        response_dict = {
+            "animation": response.animation,
+            "speech": response.text,
+            "action": getattr(response, 'action', '') or '',
+        }
+        if self._critic:
+            # Voice command source for user input
+            self._critic.set_rag_context([], source=ActionSource.VOICE_COMMAND.value)
+            verdict = self._critic.review(response_dict)
+            response_dict = verdict.corrected_output
+            self._critic.clear_rag_context()
+
         message = InteractionMessage(
-            text=response.text,
+            text=response_dict.get("speech", ""),
             event=InteractionEvent.RESPONSE,
             animation="wave",
             source="synthesis"
         )
-        
+
         self._add_message(message)
         return message
     
@@ -319,6 +357,10 @@ class InteractionHandler:
         }
         if self._action_executor:
             stats["action_stats"] = self._action_executor.get_stats()
+        if self._critic:
+            stats["critic_stats"] = self._critic.get_stats()
+        if self._action_policy:
+            stats["policy_stats"] = self._action_policy.get_stats()
         return stats
     
     def _route_side_effects(self, message: InteractionMessage) -> None:
@@ -368,6 +410,21 @@ class InteractionHandler:
                 self._action_callback(action_name, request)
             return
         
+        # ── Provenance policy check before execution ──
+        if self._action_policy:
+            source = ActionSource.AUTONOMOUS_OBSERVATION  # Default for handler-routed actions
+            action_category = request.command.category.value if request.command else ""
+            from src.actions.policy import PolicyDecision
+            decision = self._action_policy.check(
+                action_name=action_name,
+                source=source,
+                requires_approval=request.command.requires_approval if request.command else False,
+                action_category=action_category,
+            )
+            if not decision:
+                logger.warning(f"ActionPolicy blocked '{action_name}': {decision.reason}")
+                return
+
         # Execute
         result = self._action_executor.execute(request)
         if result.success:

@@ -48,6 +48,8 @@ from src.perf.watchdog import WatchdogMonitor
 from src.data.persistence import CheckpointManager
 from src.sensors.terminal import TerminalSensor
 from src.integrations.calendar import CalendarSensor
+from src.brain.critic import CognitiveCritic
+from src.actions.policy import ActionPolicy
 
 # ── Logging Setup ──
 LOG_DIR = Path(__file__).parent / "logs"
@@ -147,6 +149,13 @@ def build_cognition_stack(profiler, watchdog):
     system_executor = SystemExecutor()
     logger.info(f"System executor: {len(system_executor.get_available_actions())} actions")
 
+    # ── Cognitive Critic + Action Policy (audit remediation: live validation) ──
+    critic = CognitiveCritic(
+        action_executor=system_executor,
+        action_policy=ActionPolicy(strict_mode=True),
+    )
+    logger.info(f"Critic initialized (groundedness + provenance gating)")
+
     # ── Interaction Handler (no display callback in daemon — logs only) ──
     def log_only_callback(message: InteractionMessage) -> None:
         if message and message.text:
@@ -157,6 +166,8 @@ def build_cognition_stack(profiler, watchdog):
         display_callback=log_only_callback,
         tts_engine=tts_engine,
         action_executor=system_executor,
+        cognitive_critic=critic,
+        action_policy=critic._action_policy,
     )
 
     # ── Autonomy Loop ──

@@ -161,8 +161,9 @@ class OverlayWindow(QWidget):
     # Signal emitted while dragging (so autonomy loop can suppress)
     dragging_changed = Signal(bool)
 
-    CLOSE_ZONE_SIZE = 50
-    CLOSE_ZONE_COLOR = QColor(255, 59, 48, 160)
+    CLOSE_ZONE_SIZE = 24
+    CLOSE_ZONE_COLOR = QColor(255, 59, 48, 180)
+    CLOSE_ZONE_HOVER_COLOR = QColor(255, 80, 60, 220)
 
     # Wandering
     WANDER_INTERVAL_MS = 8_000   # Wander every 8 seconds when idle
@@ -330,11 +331,21 @@ class OverlayWindow(QWidget):
 
     # ── Close button ──────────────────────────────────────────────
 
+    def _close_zone_rect(self) -> QRect:
+        """Return the strict 24x24 pixel close button rect in the
+        absolute bottom-right corner of the window."""
+        w, h = self.width(), self.height()
+        return QRect(
+            w - self.CLOSE_ZONE_SIZE,
+            h - self.CLOSE_ZONE_SIZE,
+            self.CLOSE_ZONE_SIZE,
+            self.CLOSE_ZONE_SIZE,
+        )
+
     def _is_in_close_zone(self, pos: QPoint) -> bool:
         if not self._close_zone_enabled:
             return False
-        z = self.rect().adjusted(-self.CLOSE_ZONE_SIZE, -self.CLOSE_ZONE_SIZE, 0, 0)
-        return z.contains(pos)
+        return self._close_zone_rect().contains(pos)
 
     def _update_close_zone(self) -> None:
         if not self._close_zone_enabled or self._click_through:
@@ -425,6 +436,18 @@ class OverlayWindow(QWidget):
             r.height() - m * 2 - self._window_size[1],
         )
 
+    # ── Body click interaction ────────────────────────────────────
+
+    def _on_body_click(self) -> None:
+        """Handle a click on the character body (not close button).
+
+        Triggers the 'wave' animation briefly, then reverts to idle.
+        """
+        logger.debug("Body clicked — triggering wave animation")
+        self.set_state("wave")
+        # Revert to idle after the wave plays (2.5 seconds)
+        QTimer.singleShot(2500, lambda: self.set_state("idle"))
+
     # ── Sprite animation ──────────────────────────────────────────
 
     def _advance_sprite(self) -> None:
@@ -463,30 +486,33 @@ class OverlayWindow(QWidget):
                     p.drawPixmap(x, y, scaled)
                     p.end()
 
-            # Close zone
+            # Close zone indicator (24x24 rounded rect in bottom-right corner)
             if not self._close_zone_enabled or self._click_through:
                 return
             w, h = self.width(), self.height()
             if w <= 0 or h <= 0:
                 return
             mouse_pos = self.mapFromGlobal(QCursor.pos())
-            if not self._is_in_close_zone(mouse_pos):
+            hovered = self._is_in_close_zone(mouse_pos)
+            if not hovered:
                 return
 
             p = QPainter(self)
             p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            cx = w - self.CLOSE_ZONE_SIZE // 2
-            cy = h - self.CLOSE_ZONE_SIZE // 2
-            r = self.CLOSE_ZONE_SIZE // 2
+            zone_rect = self._close_zone_rect()
+            color = self.CLOSE_ZONE_HOVER_COLOR if hovered else self.CLOSE_ZONE_COLOR
             p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(self.CLOSE_ZONE_COLOR))
-            p.drawEllipse(QPoint(cx, cy), r, r)
-            pen = QPen(QColor(255, 255, 255, 255), 3)
+            p.setBrush(QBrush(color))
+            p.drawRoundedRect(zone_rect, 4, 4)
+            # X icon
+            pen = QPen(QColor(255, 255, 255, 240), 2)
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             p.setPen(pen)
-            off = r // 3
-            p.drawLine(cx - off, cy - off, cx + off, cy + off)
-            p.drawLine(cx + off, cy - off, cx - off, cy + off)
+            margin = 5
+            x0, y0 = zone_rect.left() + margin, zone_rect.top() + margin
+            x1, y1 = zone_rect.right() - margin, zone_rect.bottom() - margin
+            p.drawLine(x0, y0, x1, y1)
+            p.drawLine(x1, y0, x0, y1)
             p.end()
         except Exception as e:
             logger.debug(f"paintEvent: {e}")
@@ -494,12 +520,8 @@ class OverlayWindow(QWidget):
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.pos()
-            # Check close button first
-            if self._is_in_close_zone(pos) and self._close_zone_enabled:
-                logger.info("Close button clicked — shutting down")
-                self.close()
-                QApplication.quit()
-                return
+            # Do NOT close on press — defer decision to release.
+            # Only start drag tracking on press.
             self._drag_start_pos = pos
             self._is_dragging = False
         super().mousePressEvent(event)
@@ -516,11 +538,24 @@ class OverlayWindow(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
+            pos = event.pos()
+
             if self._is_dragging:
-                self.drag_finished_signal.emit(event.pos())
+                # End of drag — do NOT treat as close or interaction
+                self.drag_finished_signal.emit(pos)
                 self._is_dragging = False
                 self._drag_start_pos = None
                 self.dragging_changed.emit(False)
+            else:
+                # No drag occurred — this was a click.
+                # Check close zone FIRST (strict 24x24 bottom-right corner).
+                if self._is_in_close_zone(pos) and self._close_zone_enabled:
+                    logger.info("Close button clicked — shutting down")
+                    self.close()
+                    QApplication.quit()
+                else:
+                    # Click on body — trigger interactive animation
+                    self._on_body_click()
         super().mouseReleaseEvent(event)
 
     def enterEvent(self, event) -> None:

@@ -160,13 +160,15 @@ class OverlayWindow(QWidget):
     behavior_state_signal = Signal(object)
     # Signal emitted while dragging (so autonomy loop can suppress)
     dragging_changed = Signal(bool)
+    # Emitted when user clicks the character body (not close button)
+    user_poked = Signal()
 
     CLOSE_ZONE_SIZE = 24
     CLOSE_ZONE_COLOR = QColor(255, 59, 48, 180)
     CLOSE_ZONE_HOVER_COLOR = QColor(255, 80, 60, 220)
 
     # Wandering
-    WANDER_INTERVAL_MS = 8_000   # Wander every 8 seconds when idle
+    WANDER_INTERVAL_MS = 12_000  # Wander every 12 seconds when idle
     WANDER_DURATION_MS = 3_500   # Movement takes 3.5 seconds
 
     def __init__(
@@ -221,6 +223,8 @@ class OverlayWindow(QWidget):
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setAutoFillBackground(False)
+        self.setStyleSheet("background: transparent;")
         self.set_click_through(self._click_through)
         self.setFixedSize(*self._window_size)
         self.setMouseTracking(True)
@@ -368,6 +372,8 @@ class OverlayWindow(QWidget):
         if self._is_dragging:
             return
         bounds = self._get_safe_bounds()
+        if bounds.width() <= 0 or bounds.height() <= 0:
+            return
         tx = random.randint(bounds.left(), max(bounds.left() + 1, bounds.right()))
         ty = random.randint(bounds.top(), max(bounds.top() + 1, bounds.bottom()))
         target = QPoint(tx, ty)
@@ -375,16 +381,27 @@ class OverlayWindow(QWidget):
             return
 
         logger.debug(f"Idle wander to ({tx}, {ty})")
-        anim = QPropertyAnimation(self, b"pos")
-        anim.setDuration(self.WANDER_DURATION_MS)
-        anim.setStartValue(self.pos())
-        anim.setEndValue(target)
-        anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
-        anim.start()
+        # Keep a reference so the animation isn't garbage-collected
+        self._wander_anim = QPropertyAnimation(self, b"pos")
+        self._wander_anim.setDuration(self.WANDER_DURATION_MS)
+        self._wander_anim.setStartValue(self.pos())
+        self._wander_anim.setEndValue(target)
+        self._wander_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._wander_anim.start()
 
     def wander_to(self, target: QPoint) -> None:
-        """Public entry point for explicit wander_to calls."""
-        self._idle_wander()
+        """Move window to a specific target position."""
+        if self._is_dragging:
+            return
+        if target == self.pos():
+            return
+        logger.debug(f"Wander to requested pos ({target.x()}, {target.y()})")
+        self._wander_anim = QPropertyAnimation(self, b"pos")
+        self._wander_anim.setDuration(self.WANDER_DURATION_MS)
+        self._wander_anim.setStartValue(self.pos())
+        self._wander_anim.setEndValue(target)
+        self._wander_anim.setEasingCurve(QEasingCurve.Type.InOutQuad)
+        self._wander_anim.start()
 
     # ── State display helpers ─────────────────────────────────────
 
@@ -441,12 +458,14 @@ class OverlayWindow(QWidget):
     def _on_body_click(self) -> None:
         """Handle a click on the character body (not close button).
 
-        Triggers the 'wave' animation briefly, then reverts to idle.
+        Triggers the 'wave' animation and emits user_poked signal
+        so the LLM can respond. Reverts to idle after 3 seconds.
         """
-        logger.debug("Body clicked — triggering wave animation")
+        logger.debug("Body clicked — triggering wave + poke")
         self.set_state("wave")
-        # Revert to idle after the wave plays (2.5 seconds)
-        QTimer.singleShot(2500, lambda: self.set_state("idle"))
+        self.user_poked.emit()
+        # Revert to idle after animation plays
+        QTimer.singleShot(3000, lambda: self.set_state("idle"))
 
     # ── Sprite animation ──────────────────────────────────────────
 

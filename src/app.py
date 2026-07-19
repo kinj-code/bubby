@@ -159,6 +159,16 @@ def main() -> None:
     overlay.display_message_signal.connect(_on_display_message)
     overlay.update_state_signal.connect(_on_update_state)
 
+    # ── User poke → LLM response ──
+    def _on_user_poked() -> None:
+        """User clicked the character body — ask the LLM to say something."""
+        logger.info("User poked Bubby — triggering LLM response")
+        interaction_handler.on_user_input(
+            "The user just clicked on you / poked you. Say something brief, witty, and in-character."
+        )
+
+    overlay.user_poked.connect(_on_user_poked)
+
     autonomy_loop = AutonomyLoop(
         behavior_tree=behavior_tree, context_manager=context_manager, decision_interval=2.0,
     )

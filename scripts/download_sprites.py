@@ -18,6 +18,7 @@ Usage:
 
 from pathlib import Path
 import math
+import shutil
 import sys
 
 try:
@@ -387,6 +388,10 @@ ANIMATIONS = {
 
 
 def main():
+    # Force-clean old sprites to ensure new ones take effect
+    if SPRITE_DIR.exists():
+        shutil.rmtree(SPRITE_DIR)
+        print(f"Deleted old sprites/ directory")
     SPRITE_DIR.mkdir(exist_ok=True)
     print(f"Generating high-quality sprite frames in {SPRITE_DIR}/ ...")
     print(f"  Render resolution: {RENDER_SIZE}x{RENDER_SIZE} (downsampled to {SIZE}x{SIZE})")

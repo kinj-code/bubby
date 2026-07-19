@@ -31,7 +31,7 @@ class LLMSynthesisConfig:
     use_llm: bool = True                    # Enable LLM generation
     fallback_to_template: bool = True       # Fallback if LLM fails
     max_context_tokens: int = 1024          # Max tokens for context
-    generation_timeout_ms: int = 5000       # Max generation time
+    generation_timeout_ms: int = 60000      # Max generation time (60s for CPU inference)
     min_confidence_for_llm: float = 0.5     # Min reasoning confidence to use LLM
     
     # LLM model config
@@ -230,6 +230,89 @@ class LLMSynthesisEngine:
             self._stats["llm_failures"] += 1
         return template_response
     
+    def generate_async(
+        self,
+        reasoning: Optional[VisualReasoning],
+        context_text: str,
+        template_response: SynthesizedResponse,
+        trigger_type: str,
+        callback: callable,
+    ) -> None:
+        """
+        Generate an LLM response in a background thread and call callback on completion.
+        
+        DOES NOT block the caller. The callback receives a SynthesizedResponse
+        (which may be the template fallback if LLM fails).
+        
+        Args:
+            reasoning: Visual reasoning context
+            context_text: Raw context description
+            template_response: Pre-generated template response (fallback)
+            trigger_type: 'observation', 'greeting', 'user_input'
+            callback: Called with final SynthesizedResponse on the background thread.
+        """
+        prompt = self._build_llm_prompt(
+            reasoning=reasoning,
+            context_text=context_text,
+            template_response=template_response,
+            trigger_type=trigger_type,
+        )
+        
+        system_prompt = self._build_plain_system_prompt(
+            reasoning=reasoning,
+            context_text=context_text,
+            trigger_type=trigger_type,
+        )
+        
+        def _run():
+            try:
+                # Use plain text generation (no JSON schema — avoids timeout issues)
+                result = self._llm_inference.generate(
+                    prompt=prompt,
+                    system_prompt=system_prompt,
+                    max_tokens=self._config.max_response_tokens,
+                    temperature=self._config.temperature,
+                )
+                if result and result.text and len(result.text.strip()) > 2:
+                    cleaned = self._apply_guardrails(result.text.strip())
+                    if cleaned:
+                        self._stats["llm_responses"] += 1
+                        response = SynthesizedResponse(
+                            text=cleaned,
+                            animation="talk",
+                            context_type=template_response.context_type,
+                            has_memory_recall=template_response.has_memory_recall,
+                        )
+                        callback(response)
+                        return
+            except Exception as e:
+                logger.warning(f"Async LLM generation failed: {e}")
+            
+            # Fallback to template
+            self._stats["template_responses"] += 1
+            callback(template_response)
+        
+        thread = threading.Thread(target=_run, daemon=True)
+        thread.start()
+
+    def _build_plain_system_prompt(
+        self,
+        reasoning: Optional[VisualReasoning],
+        context_text: str,
+        trigger_type: str,
+    ) -> str:
+        """Build a simple conversational system prompt (no JSON schema)."""
+        name = self._persona.name
+        style = self._persona.style_tagline
+        personality = getattr(self._persona, 'personality', 'friendly and helpful')
+        
+        return (
+            f"You are {name}, a cute desktop companion slime. {style}\n"
+            f"Personality: {personality}\n"
+            f"Be brief, warm, and conversational. Use 1-2 sentences max.\n"
+            f"Never mention you are an AI. Stay in character."
+        )
+
     def _generate_llm_response(
         self,
         reasoning: Optional[VisualReasoning],
@@ -238,15 +321,11 @@ class LLMSynthesisEngine:
         trigger_type: str,
     ) -> Optional[StructuredResponse]:
         """
-        Generate a grammar-constrained JSON response from the LLM.
-        
-        Uses llama-cpp-python's JSON schema support to enforce
-        structured output (animation + speech).
+        Synchronous plain-text LLM response (used for non-critical paths).
         
         Returns:
             StructuredResponse if successful, None on failure/timeout
         """
-        # Build prompt using persona-aware prompt builders
         prompt = self._build_llm_prompt(
             reasoning=reasoning,
             context_text=context_text,
@@ -254,59 +333,29 @@ class LLMSynthesisEngine:
             trigger_type=trigger_type,
         )
         
-        system_prompt = self._build_structured_system_prompt(
+        system_prompt = self._build_plain_system_prompt(
             reasoning=reasoning,
             context_text=context_text,
             trigger_type=trigger_type,
         )
         
         try:
-            # Run with timeout using thread
-            result_container = {"result": None, "error": None}
-            
-            def generate():
-                try:
-                    result_container["result"] = self._llm_inference.generate_structured(
-                        prompt=prompt,
-                        system_prompt=system_prompt,
-                        max_tokens=self._config.max_response_tokens,
-                        temperature=self._config.temperature,
-                        json_schema=BUBBY_RESPONSE_JSON_SCHEMA,
-                    )
-                except Exception as e:
-                    result_container["error"] = e
-            
-            thread = threading.Thread(target=generate)
-            thread.start()
-            thread.join(timeout=self._config.generation_timeout_ms / 1000.0)
-            
-            if thread.is_alive():
-                logger.warning("LLM structured generation timed out")
-                self._stats["llm_timeouts"] += 1
-                return None
-            
-            if result_container["error"]:
-                logger.error(f"LLM structured generation error: {result_container['error']}")
-                return None
-            
-            inference_result = result_container["result"]
-            if not inference_result or not inference_result.text:
-                return None
-            
-            # Parse the JSON output into StructuredResponse
-            structured = parse_structured_response(inference_result.text)
-            
-            logger.debug(
-                f"LLM structured response: animation={structured.animation}, "
-                f"speech={structured.speech[:40] if structured.speech else '(silent)'}, "
-                f"valid={structured.is_valid}"
+            result = self._llm_inference.generate(
+                prompt=prompt,
+                system_prompt=system_prompt,
+                max_tokens=self._config.max_response_tokens,
+                temperature=self._config.temperature,
             )
-            
-            return structured
-            
+            if result and result.text and len(result.text.strip()) > 2:
+                return StructuredResponse(
+                    animation="talk",
+                    speech=result.text.strip(),
+                    is_valid=True,
+                )
         except Exception as e:
-            logger.error(f"LLM structured generation failed: {e}")
-            return None
+            logger.warning(f"LLM generation failed: {e}")
+        
+        return None
     
     def _build_structured_system_prompt(
         self,

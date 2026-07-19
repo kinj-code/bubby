@@ -165,21 +165,59 @@ def main() -> None:
     overlay.display_message_signal.connect(_on_display_message)
     overlay.update_state_signal.connect(_on_update_state)
 
-    # ── User poke → LLM response ──
+    # ── Async LLM dispatch (NEVER blocks the Qt event loop) ──
+    import threading as _threading
+
+    def _dispatch_llm_async(context_text: str, trigger_type: str = "user_input") -> None:
+        """Run LLM synthesis in a background daemon thread, then emit UI update."""
+        # Get template response immediately (instant)
+        template = synthesis_engine._template_engine.synthesize(
+            reasoning=None,
+            context_text=context_text,
+            trigger_type=trigger_type,
+        )
+
+        def _bg_task():
+            def _on_result(response):
+                # This runs on the bg thread — use Qt signal to marshal to main thread
+                message = InteractionMessage(
+                    text=response.text,
+                    event=InteractionEvent.RESPONSE,
+                    animation=response.animation,
+                    source="synthesis",
+                )
+                # Emit via signal so main thread handles the display
+                overlay.display_message_signal.emit(
+                    message.text,
+                    message.animation,
+                    message.event.value,
+                )
+
+            synthesis_engine.generate_async(
+                reasoning=None,
+                context_text=context_text,
+                template_response=template,
+                trigger_type=trigger_type,
+                callback=_on_result,
+            )
+
+        t = _threading.Thread(target=_bg_task, daemon=True)
+        t.start()
+
     def _on_user_poked() -> None:
-        """User clicked the character body — ask the LLM to say something."""
-        logger.info("User poked Bubby — triggering LLM response")
-        interaction_handler.on_user_input(
-            "The user just clicked on you / poked you. Say something brief, witty, and in-character."
+        """User clicked the character body — dispatch async LLM."""
+        logger.info("User poked Bubby — triggering async LLM response")
+        _dispatch_llm_async(
+            "The user just clicked on you / poked you. Say something brief, witty, and in-character.",
+            trigger_type="user_input",
         )
 
     overlay.user_poked.connect(_on_user_poked)
 
-    # ── Chat input → LLM response ──
     def _on_user_message(text: str) -> None:
-        """User typed a message in the overlay input box."""
+        """User typed a message — dispatch async LLM."""
         logger.info(f"User input from overlay: {text[:60]}")
-        interaction_handler.on_user_input(text)
+        _dispatch_llm_async(text, trigger_type="user_input")
 
     overlay.user_message_submitted.connect(_on_user_message)
 

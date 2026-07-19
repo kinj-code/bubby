@@ -206,6 +206,17 @@ class VisionPipeline:
         logger.debug("Pipeline stats reset")
     
     # Callback for vision observations
+    def start(self, capture_interval: float = 5.0) -> None:
+        """Initialize vision processing (no-op: pipeline is stateless)."""
+        self._running = True
+        self._capture_interval = capture_interval
+        logger.info(f"Vision pipeline active (interval={capture_interval:.1f}s)")
+
+    def stop(self) -> None:
+        """Stop vision processing."""
+        self._running = False
+        logger.info("Vision pipeline stopped")
+
     def set_callback(self, callback) -> None:
         """Set callback for vision observations."""
         self._callback = callback

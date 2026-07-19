@@ -1,0 +1,13 @@
+PySide6
+numpy
+Pillow
+dbus-next
+pipewire-capture
+python-dotenv
+# Phase 3, Part 2: VLM Integration
+torch>=2.0.0
+transformers>=4.30.0
+huggingface-hub>=0.16.0
+accelerate>=0.20.0
+# Phase 7A: Local LLM Integration
+llama-cpp-python>=0.2.70

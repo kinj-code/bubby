@@ -1,0 +1,19 @@
+[project]
+name = "bubby"
+version = "0.1.0"
+description = "Local multimodal AI desktop companion for Wayland"
+authors = ["Author <author@example.com>"]
+readme = "README.md"
+requires-python = ">=3.11"
+
+[project.dependencies]
+PySide6 = "*"
+numpy = "*"
+Pillow = "*"
+dbus-next = "*"
+pipewire-capture = "*"
+python-dotenv = "*"
+
+[tool.poetry]
+name = "bubby"
+version = "0.1.0"

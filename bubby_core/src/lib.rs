@@ -8,6 +8,7 @@
 pub mod memory;
 pub mod vector;
 pub mod ipc;
+pub mod security;
 
 /// Core version string.
 pub const VERSION: &str = env!("CARGO_PKG_VERSION");

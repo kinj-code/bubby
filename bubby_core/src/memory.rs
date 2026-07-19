@@ -4,6 +4,12 @@
 //! Uses `rusqlite` with WAL mode for concurrent reads via connection pooling.
 //! Deterministic memory allocation, zero GC pauses.
 //!
+//! ## Security (Phase 2.1)
+//! When opened via `open_encrypted()`, the database is encrypted with
+//! SQLCipher using AES-256. The encryption key is a hex-encoded 256-bit
+//! key managed by `crate::security::KeyManager`. Without the correct key,
+//! the database file appears as random bytes.
+//!
 //! Schema matches the Python implementation and extends it with:
 //! - BLOB storage for embedding vectors alongside records
 //! - JSON metadata extraction for indexed queries
@@ -59,19 +65,50 @@ unsafe impl Send for MemoryStore {}
 unsafe impl Sync for MemoryStore {}
 
 impl MemoryStore {
-    /// Open (or create) the memory store at the given path.
+    /// Open (or create) the memory store at the given path **without encryption**.
     ///
     /// Enables WAL mode, creates the schema with indices, and sets
     /// pragmas for performance under concurrency.
+    ///
+    /// Prefer `open_encrypted()` in production.
     pub fn open<P: AsRef<Path>>(path: P) -> SqlResult<Self> {
         let conn = Connection::open(&path)?;
+        Self::finish_open(conn, Some(path.as_ref().to_string_lossy().to_string()))
+    }
 
-        // WAL mode — writers don't block readers
+    /// Open (or create) the memory store with **SQLCipher AES-256 encryption**.
+    ///
+    /// `hex_key` must be a 64-character hex string (32 bytes).
+    /// The key is applied via `PRAGMA key` **immediately** after connection —
+    /// before any other SQL is executed. This ensures the database file
+    /// is encrypted at rest and unreadable without the key.
+    pub fn open_encrypted<P: AsRef<Path>>(path: P, hex_key: &str) -> SqlResult<Self> {
+        let conn = Connection::open(&path)?;
+
+        // Apply the encryption key BEFORE any other operation.
+        // SQLCipher intercepts this pragma and uses it to derive the
+        // AES-256 key for the page-level encryption.
+        conn.execute_batch(&format!("PRAGMA key = \"x'{}'\";", hex_key))?;
+
+        // Verify the key works by attempting a simple query.
+        // If the key is wrong, this will return an error like
+        // "file is not a database".
+        conn.query_row("SELECT 1", [], |_| Ok(()))?;
+
+        Self::finish_open(conn, Some(path.as_ref().to_string_lossy().to_string()))
+    }
+
+    /// Common post-connection initialisation.
+    fn finish_open(conn: Connection, db_path: Option<String>) -> SqlResult<Self> {
+        // WAL mode — writers don't block readers (works with SQLCipher)
         conn.pragma_update(None, "journal_mode", "WAL")?;
         conn.pragma_update(None, "synchronous", "NORMAL")?;
         conn.pragma_update(None, "cache_size", -2000)?; // 2 MB page cache
         conn.pragma_update(None, "busy_timeout", 5000)?; // 5 s busy-wait
         conn.pragma_update(None, "foreign_keys", "ON")?;
+        // SQLCipher-specific: use fast KDF for local performance
+        conn.pragma_update(None, "cipher_kdf_algorithm", "PBKDF2_HMAC_SHA512")?;
+        conn.pragma_update(None, "cipher_page_size", "4096")?;
 
         // Create schema
         conn.execute_batch(
@@ -105,7 +142,7 @@ impl MemoryStore {
 
         Ok(Self {
             conn: Mutex::new(conn),
-            db_path: Some(path.as_ref().to_string_lossy().to_string()),
+            db_path,
             next_id: Mutex::new(next_id),
             total_adds: Mutex::new(total_adds),
             total_queries: Mutex::new(0),
@@ -935,6 +972,116 @@ mod tests {
                 .expect("embedding should persist");
             assert_eq!(dim, 4);
             assert_eq!(emb, vec![1.0, 2.0, 3.0, 4.0]);
+        }
+    }
+
+    // ── Encryption tests (Phase 2.1) ────────────────────────────
+
+    /// Generate a deterministic key for testing (NOT for production).
+    fn test_key() -> String {
+        "0".repeat(64)
+    }
+
+    #[test]
+    fn test_encrypted_open_creates_and_reads() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("encrypted_memory.db");
+        let key = test_key();
+
+        // Write encrypted
+        {
+            let store = MemoryStore::open_encrypted(&db_path, &key).unwrap();
+            store.add("secret data", 1.0, 0.9, r#"{"source":"test"}"#).unwrap();
+            store.add_with_embedding("embedded", 2.0, 0.5, "{}", &vec![1.0, 0.0, 0.0, 0.0]).unwrap();
+            assert_eq!(store.count(), 2);
+            assert_eq!(store.embedding_count(), 1);
+        }
+
+        // Read back with the same key
+        {
+            let store = MemoryStore::open_encrypted(&db_path, &key).unwrap();
+            assert_eq!(store.count(), 2);
+            let results = store.search_by_text("secret", 5).unwrap();
+            assert_eq!(results.len(), 1);
+            assert_eq!(results[0].text, "secret data");
+
+            let emb_results = store.search_by_embedding(&[1.0, 0.0, 0.0, 0.0], 1, 0.0).unwrap();
+            assert_eq!(emb_results[0].record.text, "embedded");
+        }
+    }
+
+    #[test]
+    fn test_encrypted_open_wrong_key_rejected() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("encrypted_reject.db");
+        let key = test_key();
+        let wrong_key = "f".repeat(64);
+
+        // Create encrypted file
+        {
+            let store = MemoryStore::open_encrypted(&db_path, &key).unwrap();
+            store.add("test", 0.0, 0.5, "{}").unwrap();
+            drop(store);
+        }
+
+        // Attempt to open with wrong key — must fail
+        let result = MemoryStore::open_encrypted(&db_path, &wrong_key);
+        assert!(result.is_err(), "Should reject wrong encryption key");
+
+        // Attempt to open without encryption — must also fail
+        let result = MemoryStore::open(&db_path);
+        if let Ok(store) = result {
+            // If it doesn't error, any query should return garbage/error
+            match store.get_recent(1) {
+                Err(_) => { /* expected — can't read encrypted file */ }
+                Ok(records) => {
+                    assert!(
+                        records.is_empty() || records[0].text != "test",
+                        "Unencrypted open should produce garbage, not the original record"
+                    );
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn test_encrypted_persistence() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("encrypted_persist.db");
+        let key = test_key();
+
+        // Write phase
+        {
+            let store = MemoryStore::open_encrypted(&db_path, &key).unwrap();
+            for i in 0..10 {
+                let text = if i == 5 {
+                    "encrypted record 5 with string index".to_string()
+                } else {
+                    format!("encrypted record {}", i)
+                };
+                store.add(
+                    &text,
+                    i as f64,
+                    0.5 + i as f64 * 0.05,
+                    &format!(r#"{{"index":"{}"}}"#, i),
+                ).unwrap();
+            }
+            assert_eq!(store.count(), 10);
+        }
+
+        // Reopen phase
+        {
+            let store = MemoryStore::open_encrypted(&db_path, &key).unwrap();
+            assert_eq!(store.count(), 10);
+            let recent = store.get_recent(3).unwrap();
+            assert_eq!(recent.len(), 3);
+            // Most recent first (label for record 5 is different)
+            assert!(recent[0].text.starts_with("encrypted record"));
+
+            // Metadata search works on encrypted data (index stored as JSON string — JSON_EXTRACT returns the raw string value)
+            let meta = store.search_by_metadata("index", "5", 1).unwrap();
+            assert_eq!(meta.len(), 1);
+            assert_eq!(meta[0].text, "encrypted record 5 with string index");
         }
     }
 }

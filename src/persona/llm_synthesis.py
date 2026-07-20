@@ -265,20 +265,24 @@ class LLMSynthesisEngine:
         )
         
         def _run():
-            # If LLM is not initialized, fallback immediately (no warning spam)
-            if not self._llm_inference or not self._llm_inference.is_ready():
-                self._stats["template_responses"] += 1
-                callback(template_response)
-                return
-            
+            # ══ NO GUARD: Force real LLM — raise if model is None ══
+            if not self._llm_inference:
+                raise ValueError("LLM model is None — cannot generate.")
+
+            import traceback as _traceback
+            logger.info("LLM inference starting...")
+
             try:
-                # Use plain text generation (no JSON schema — avoids timeout issues)
+                # Force real inference — no is_ready() short-circuit
                 result = self._llm_inference.generate(
                     prompt=prompt,
                     system_prompt=system_prompt,
                     max_tokens=self._config.max_response_tokens,
                     temperature=self._config.temperature,
                 )
+
+                # `generate` now raises on failure instead of returning error strings.
+                # If we reach here, inference succeeded.
                 if result and result.text and len(result.text.strip()) > 2:
                     cleaned = self._apply_guardrails(result.text.strip())
                     if cleaned:
@@ -289,14 +293,42 @@ class LLMSynthesisEngine:
                             context_type=template_response.context_type,
                             has_memory_recall=template_response.has_memory_recall,
                         )
+                        logger.info(
+                            f"LLM inference complete in {result.generation_time_ms:.0f}ms "
+                            f"({result.tokens_generated} tokens)"
+                        )
                         callback(response)
                         return
+                    else:
+                        # Guardrails stripped the response — log as warning
+                        logger.warning("LLM response was stripped by guardrails (empty after cleaning)")
+                else:
+                    logger.warning(f"LLM returned empty/short response: '{result.text if result else 'None'}'")
+
+            except ValueError as ve:
+                # Model not loaded — cannot fallback silently
+                logger.error(f"LLM ERROR: {ve}")
+                logger.error(_traceback.format_exc())
+                callback(SynthesizedResponse(
+                    text=f"[LLM ERROR: {ve}]",
+                    animation="confused",
+                ))
+                return
             except Exception as e:
-                logger.warning(f"Async LLM generation failed: {e}")
-            
-            # Fallback to template
-            self._stats["template_responses"] += 1
-            callback(template_response)
+                logger.error(f"LLM generation CRASHED:")
+                logger.error(_traceback.format_exc())
+                callback(SynthesizedResponse(
+                    text=f"[LLM ERROR: {e}]",
+                    animation="confused",
+                ))
+                return
+
+            # Only reach here if response was empty or stripped — log and send error
+            logger.warning("LLM response was empty after generation — returning error")
+            callback(SynthesizedResponse(
+                text="[LLM ERROR: Empty response]",
+                animation="confused",
+            ))
         
         thread = threading.Thread(target=_run, daemon=True)
         thread.start()

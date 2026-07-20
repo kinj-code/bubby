@@ -19,11 +19,11 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import (
     Qt, QPoint, QTimer, QSize, Signal, QPropertyAnimation,
-    QEasingCurve, QRect, QRegion,
+    QEasingCurve, QRect,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QCursor, QPixmap, QFont,
-    QPainterPath, QBitmap,
+    QPainterPath, QBitmap, QRegion,
 )
 
 from src.brain.decisions import Decision, DecisionType

@@ -4,10 +4,10 @@ Architecture (decoupled, thread-safe via Qt Signal/Slot):
 - AutonomyLoop (QThread) emits decision_made Signal → main thread slot
 - Vision pipeline callbacks → InteractionHandler → overlay signal → main thread
 - Zero direct widget calls from background threads
+- LLM async responses marshalled via Qt Signal to main thread
 """
 
 # ── Faulthandler: produce C/C++ stack trace on segfault ──────────
-# Must be the very first imports before any Qt libraries.
 import faulthandler
 import os
 import signal
@@ -26,13 +26,12 @@ import sys
 from pathlib import Path
 from typing import Optional
 
-# Force X11 platform before PySide6 imports to avoid
-# Wayland segfaults on headless/XWayland desktops.
+# Force X11 platform before PySide6 imports
 if not os.environ.get("QT_QPA_PLATFORM"):
     os.environ["QT_QPA_PLATFORM"] = "xcb"
 
 from PySide6.QtWidgets import QApplication, QMessageBox, QFileDialog
-from PySide6.QtCore import QTimer, QPoint
+from PySide6.QtCore import QTimer, QPoint, QObject, Signal
 
 from src.ui.overlay import OverlayWindow
 from src.ui.avatar import AvatarWidget, AvatarConfig
@@ -49,6 +48,7 @@ from src.vision.pipeline import VisionPipeline
 from src.memory.long_term_memory import LongTermMemory
 from src.persona.config import PersonaConfig, PersonaType
 from src.persona.llm_synthesis import LLMSynthesisEngine, LLMSynthesisConfig
+from src.persona.synthesis import SynthesizedResponse
 from src.interaction.handler import InteractionHandler, InteractionMessage, InteractionEvent
 from src.actions.executor import SystemExecutor
 from src.voice.tts_engine import TTSEngine, TTSConfig
@@ -59,8 +59,19 @@ USE_LLM = os.environ.get("BUBBY_USE_LLM", "1") == "1"
 USE_TTS = os.environ.get("BUBBY_USE_TTS", "0") == "1"
 
 
+# ══ Thread-safe LLM response bridge ══
+class LLMResponseBridge(QObject):
+    """
+    Marshals LLM responses from background threads to the Qt main thread.
+
+    The LLM generate_async callback runs on a background daemon thread.
+    This bridge converts those callbacks into signals that Qt delivers
+    to the main thread, where UI updates are safe.
+    """
+    response_ready = Signal(object)  # SynthesizedResponse
+
+
 def create_behavior_tree() -> BehaviorTree:
-    """Create the behavior tree for autonomous decision-making."""
     def idle_action(context):
         return DecisionType.IDLE
     def wander_action(context):
@@ -86,7 +97,6 @@ def create_behavior_tree() -> BehaviorTree:
 
 
 def main() -> None:
-    """Initialize and launch the Bubby desktop companion."""
     logging.basicConfig(
         level=logging.INFO,
         format="%(asctime)s | %(levelname)-8s | %(name)-20s | %(message)s",
@@ -127,6 +137,35 @@ def main() -> None:
     avatar_widget.set_state("idle")
     overlay.set_animation_widget(avatar_widget)
 
+    # ══ LLM Response Bridge (thread-safe signal) ══
+    llm_bridge = LLMResponseBridge()
+
+    def _on_llm_response(response: SynthesizedResponse) -> None:
+        """SLOT: receives SynthesizedResponse on main thread via signal."""
+        if not response or not response.text:
+            logger.warning("LLM returned empty response — no UI update")
+            return
+        try:
+            message = InteractionMessage(
+                text=response.text,
+                event=InteractionEvent.RESPONSE,
+                animation=getattr(response, 'animation', 'talk'),
+                source="synthesis",
+            )
+            # Update overlay and avatar
+            overlay.display_message_signal.emit(
+                message.text,
+                message.animation,
+                message.event.value,
+            )
+            overlay.update_state_signal.emit(message.animation, message.text)
+            logger.info(f"[LLM→UI] {message.text[:60]}")
+        except Exception as e:
+            logger.error(f"Failed to dispatch LLM response to UI: {e}")
+
+    # Connect bridge signal to main thread slot
+    llm_bridge.response_ready.connect(_on_llm_response)
+
     # ── THREAD-SAFE UI dispatch ──
     def display_to_overlay(message: InteractionMessage) -> None:
         if not message or not message.text:
@@ -166,45 +205,61 @@ def main() -> None:
     overlay.display_message_signal.connect(_on_display_message)
     overlay.update_state_signal.connect(_on_update_state)
 
-    # ── Async LLM dispatch (NEVER blocks the Qt event loop) ──
+    # ══ Async LLM dispatch (NEVER blocks the Qt event loop) ══
     import threading as _threading
 
     def _dispatch_llm_async(context_text: str, trigger_type: str = "user_input") -> None:
-        """Run LLM synthesis in a background daemon thread, then emit UI update."""
+        """Run LLM synthesis in a background daemon thread, emit via bridge signal."""
+
         # Get template response immediately (instant)
-        template = synthesis_engine._template_engine.synthesize(
-            reasoning=None,
-            context_text=context_text,
-            trigger_type=trigger_type,
-        )
-
-        def _bg_task():
-            def _on_result(response):
-                message = InteractionMessage(
-                    text=response.text,
-                    event=InteractionEvent.RESPONSE,
-                    animation=response.animation,
-                    source="synthesis",
-                )
-                overlay.display_message_signal.emit(
-                    message.text,
-                    message.animation,
-                    message.event.value,
-                )
-
-            synthesis_engine.generate_async(
+        try:
+            template = synthesis_engine._template_engine.synthesize(
                 reasoning=None,
                 context_text=context_text,
-                template_response=template,
                 trigger_type=trigger_type,
-                callback=_on_result,
             )
+        except Exception as e:
+            logger.warning(f"Template synthesis failed: {e}")
+            template = None
+
+        def _bg_task():
+            try:
+                # If synthesis engine has generate_async, use it
+                if hasattr(synthesis_engine, 'generate_async') and template:
+                    def _on_result(response):
+                        # This callback runs on bg thread — emit signal
+                        llm_bridge.response_ready.emit(response)
+
+                    synthesis_engine.generate_async(
+                        reasoning=None,
+                        context_text=context_text,
+                        template_response=template,
+                        trigger_type=trigger_type,
+                        callback=_on_result,
+                    )
+                elif template:
+                    # Direct response via bridge
+                    llm_bridge.response_ready.emit(template)
+                else:
+                    # Emergency fallback
+                    fallback = SynthesizedResponse(
+                        text="Hey! I'm here. What's up? 😊",
+                        animation="wave",
+                    )
+                    llm_bridge.response_ready.emit(fallback)
+            except Exception as e:
+                logger.error(f"LLM dispatch error: {e}", exc_info=True)
+                # Emergency fallback on error
+                fallback = SynthesizedResponse(
+                    text="Sorry, I hit a snag. Try again?",
+                    animation="confused",
+                )
+                llm_bridge.response_ready.emit(fallback)
 
         t = _threading.Thread(target=_bg_task, daemon=True)
         t.start()
 
     def _on_user_poked() -> None:
-        """User clicked the character body — dispatch async LLM."""
         logger.info("User poked Bubby — triggering async LLM response")
         _dispatch_llm_async(
             "The user just clicked on you / poked you. Say something brief, witty, and in-character.",
@@ -216,13 +271,23 @@ def main() -> None:
     def _on_user_message(text: str) -> None:
         """User typed a message or dropped files — dispatch async LLM."""
         logger.info(f"User input from overlay: {text[:80]}")
-        # Parse file drop prefix
+
         if text.startswith("[DROPPED FILES]"):
-            # Send to LLM with context about the dropped files
-            _dispatch_llm_async(
-                f"The user dropped the following files on you. Acknowledge them and offer to help:\n{text}",
-                trigger_type="user_input",
+            # Extract file paths from the message
+            file_part = text.replace("[DROPPED FILES]\n", "").strip()
+            file_paths = [p.strip() for p in file_part.split("\n") if p.strip()]
+            file_summary = "\n".join(file_paths[:5])  # Limit to 5 files
+            file_count = len(file_paths)
+
+            # ══ FIX: Route through interaction_handler for proper LLM processing ══
+            context = (
+                f"The user dropped {file_count} file(s) on you. "
+                f"Files:\n{file_summary}\n\n"
+                f"Acknowledge the files briefly and offer to help with them. "
+                f"Keep your response to 1-2 sentences."
             )
+            # Also show in chat
+            _dispatch_llm_async(context, trigger_type="user_input")
         else:
             _dispatch_llm_async(text, trigger_type="user_input")
 

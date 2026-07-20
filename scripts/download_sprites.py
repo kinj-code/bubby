@@ -2,13 +2,13 @@
 """
 Generate high-quality procedural sprite frames for the Bubby companion.
 
-Draws a cute bottle-shaped slime/robot character using supersampled
+Draws a cute bottle-shaped slime character using supersampled
 anti-aliasing, radial gradients, drop shadows, and smooth curves.
 All frames have transparent backgrounds (RGBA alpha channel).
 
 Character: Blue, bottle-shaped/rounded-rectangle body with a small bump
 on top. Large, perfectly round white eyes with dark pupils and
-catch-light highlights.
+catch-light highlights. BLUSH ONLY. NO HANDS, NO DETACHED ELEMENTS.
 
 Animations generated:
   - idle   : gentle breathing + occasional eye blink
@@ -52,10 +52,7 @@ MOUTH_COLOR = (25, 45, 60, 200)
 def _create_radial_gradient(width: int, height: int,
                             inner_color: tuple, outer_color: tuple,
                             center_y_ratio: float = 0.5) -> Image.Image:
-    """Create a smooth radial gradient image (RGBA).
-    
-    center_y_ratio: vertical position of the gradient center (0=top, 1=bottom).
-    """
+    """Create a smooth radial gradient image (RGBA)."""
     img = Image.new("RGBA", (width, height), (0, 0, 0, 0))
     cx, cy = width / 2, height * center_y_ratio
     max_dist = math.sqrt(cx * cx + max(cy * cy, (height - cy) * (height - cy)))
@@ -78,10 +75,8 @@ def _draw_body_mask(draw: ImageDraw.Draw, size: int, squash_x: float = 1.0,
                      squash_y: float = 1.0, offset_y: int = 0) -> None:
     """
     Draw a bottle-shaped body mask: tall rounded rectangle with a small
-    bump on top. Wider at the bottom, slightly narrower in the middle,
-    and a curved top.
+    bump on top. Single continuous shape — NO detached elements.
     """
-    # Body dimensions
     bw = int(size * 0.44 * squash_x)    # body width
     bh = int(size * 0.56 * squash_y)    # body height
     bx0 = (size - bw) // 2
@@ -90,7 +85,7 @@ def _draw_body_mask(draw: ImageDraw.Draw, size: int, squash_x: float = 1.0,
     by1 = by0 + bh
 
     # Main body: rounded rectangle
-    corner_r = int(bw * 0.22)  # rounded corners
+    corner_r = int(bw * 0.22)
     draw.rounded_rectangle([bx0, by0, bx1, by1], radius=corner_r, fill=255)
 
     # Bump on top: a smaller rounded rect protruding upward from center
@@ -120,14 +115,8 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
     """
     Draw a single slime frame at RENDER_SIZE resolution.
 
-    Args:
-        size: Render canvas size (RENDER_SIZE).
-        phase: Animation phase 0.0–1.0.
-        mouth_open: 0.0 = closed, 1.0 = fully open.
-        squash_x: Horizontal squash/stretch factor.
-        squash_y: Vertical squash/stretch factor.
-        offset_y: Vertical offset for bounce.
-        eye_blink: 0.0 = fully open, 1.0 = fully closed.
+    ONLY the bottle-shaped body, eyes, blush, and mouth.
+    NO hands, NO arcs/detached shapes, NO emoji artifacts.
     """
     img = Image.new("RGBA", (size, size), (0, 0, 0, 0))
 
@@ -164,11 +153,11 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
     outline_dark.putalpha(outline_inv)
     img = Image.alpha_composite(img, outline_dark)
 
-    # ── 5. Eyes — large, perfectly round ──────────────────────────
-    eye_draw = ImageDraw.Draw(img)
+    # ── 5. Eyes — large, perfectly round, NO extra arcs ───────────
+    main_draw = ImageDraw.Draw(img)
     eye_y = int(size * 0.37) + offset_y
     eye_spacing = int(size * 0.11)
-    eye_radius = int(size * 0.09)  # large round eyes
+    eye_radius = int(size * 0.09)
 
     blink_scale = max(0.08, 1.0 - eye_blink * 0.92)
     eye_actual_ry = max(2, int(eye_radius * blink_scale))
@@ -177,8 +166,8 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
     right_cx = size // 2 + eye_spacing
 
     for cx in (left_cx, right_cx):
-        # White
-        eye_draw.ellipse(
+        # White of eye — ONLY ellipse, NO extra arcs
+        main_draw.ellipse(
             [cx - eye_radius, eye_y - eye_actual_ry,
              cx + eye_radius, eye_y + eye_actual_ry],
             fill=EYE_WHITE,
@@ -187,7 +176,7 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
             # Pupil
             pupil_r = int(eye_radius * 0.48)
             pupil_ox = int(size * 0.010)
-            eye_draw.ellipse(
+            main_draw.ellipse(
                 [cx - pupil_r + pupil_ox, eye_y - pupil_r,
                  cx + pupil_r + pupil_ox, eye_y + pupil_r],
                 fill=PUPIL_COLOR,
@@ -196,13 +185,13 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
             hl_r = max(2, int(eye_radius * 0.30))
             hl_ox = int(size * 0.018)
             hl_oy = -int(size * 0.015)
-            eye_draw.ellipse(
+            main_draw.ellipse(
                 [cx + hl_ox - hl_r, eye_y + hl_oy - hl_r,
                  cx + hl_ox + hl_r, eye_y + hl_oy + hl_r],
                 fill=HIGHLIGHT,
             )
 
-    # ── 6. Blush ───────────────────────────────────────────────────
+    # ── 6. Blush — soft circles, NO detached shapes ────────────────
     blush_r = int(size * 0.05)
     blush_y = int(size * 0.43) + offset_y
     blush_spacing = int(size * 0.18)
@@ -217,24 +206,24 @@ def _draw_slime_frame(size: int, phase: float = 0.0,
         blush_tmp = blush_tmp.filter(ImageFilter.GaussianBlur(radius=size * 0.025))
         img = Image.alpha_composite(img, blush_tmp)
 
-    # ── 7. Mouth ───────────────────────────────────────────────────
+    # ── 7. Mouth — ONLY ellipse or nothing, NO arc ────────────────
     mouth_cx = size // 2
     mouth_y = int(size * 0.46) + offset_y
 
     if mouth_open < 0.05:
-        # Happy arc (closed)
-        mw = int(size * 0.08)
-        mh = int(size * 0.03)
-        eye_draw.arc(
-            [mouth_cx - mw, mouth_y, mouth_cx + mw, mouth_y + mh],
-            start=0, end=180,
+        # Closed mouth: draw a small ellipse (not arc) for a clean smile
+        mw = int(size * 0.04)
+        mh = int(size * 0.025)
+        main_draw.ellipse(
+            [mouth_cx - mw, mouth_y - mh // 2,
+             mouth_cx + mw, mouth_y + mh // 2],
             fill=MOUTH_COLOR,
-            width=max(2, int(size * 0.010)),
         )
     else:
+        # Open mouth: oval
         mw = int(size * 0.06 + size * 0.03 * mouth_open)
         mh = int(size * 0.025 + size * 0.06 * mouth_open)
-        eye_draw.ellipse(
+        main_draw.ellipse(
             [mouth_cx - mw, mouth_y, mouth_cx + mw, mouth_y + mh],
             fill=MOUTH_COLOR,
         )
@@ -326,9 +315,9 @@ def main():
         shutil.rmtree(SPRITE_DIR)
         print(f"Deleted old sprites/ directory")
     SPRITE_DIR.mkdir(exist_ok=True)
-    print(f"Generating high-quality sprite frames in {SPRITE_DIR}/ ...")
+    print(f"Generating clean sprite frames in {SPRITE_DIR}/ ...")
     print(f"  Render resolution: {RENDER_SIZE}x{RENDER_SIZE} (downsampled to {SIZE}x{SIZE})")
-    print(f"  Character: bottle-shaped blue slime with large round eyes + drop shadow")
+    print(f"  Character: bottle-shaped blue slime — NO hands, NO arcs, NO artifacts")
 
     for name, generator in ANIMATIONS.items():
         out_dir = SPRITE_DIR / name
@@ -339,7 +328,7 @@ def main():
             img.save(str(path))
         print(f"  {name}: {len(frames)} frames saved to {out_dir}/")
 
-    print(f"\nDone! {len(ANIMATIONS)} animations generated.")
+    print(f"\nDone! {len(ANIMATIONS)} animations generated — clean bottle-shaped slime only.")
     print(f"Sprites ready for use. Run: PYTHONPATH=. python3 src/app.py")
 
 

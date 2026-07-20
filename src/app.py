@@ -140,7 +140,6 @@ def main() -> None:
         }
         animation = animation_map.get(message.event, "idle")
         logger.info(f"[UI->Avatar] {message.event.value}: {message.text[:60]}")
-        # Emit signals — Qt delivers to main thread automatically
         overlay.display_message_signal.emit(message.text, animation, message.event.value)
         overlay.update_state_signal.emit(animation, message.text)
 
@@ -157,14 +156,11 @@ def main() -> None:
     )
 
     def _on_display_message(text, animation, event_type):
-        # ONLY show the message text — don't double-set avatar state
-        # (avatar state is managed by _on_update_state signal)
         overlay.show_message(text=text, animation=animation, event_type=event_type)
 
     def _on_update_state(state_name, message_text):
         if avatar_widget:
             avatar_widget.set_state(state_name, message_text)
-        # Also update overlay animation
         overlay.set_state(state_name, message_text)
 
     overlay.display_message_signal.connect(_on_display_message)
@@ -184,14 +180,12 @@ def main() -> None:
 
         def _bg_task():
             def _on_result(response):
-                # This runs on the bg thread — use Qt signal to marshal to main thread
                 message = InteractionMessage(
                     text=response.text,
                     event=InteractionEvent.RESPONSE,
                     animation=response.animation,
                     source="synthesis",
                 )
-                # Emit via signal so main thread handles the display
                 overlay.display_message_signal.emit(
                     message.text,
                     message.animation,
@@ -220,9 +214,17 @@ def main() -> None:
     overlay.user_poked.connect(_on_user_poked)
 
     def _on_user_message(text: str) -> None:
-        """User typed a message — dispatch async LLM."""
-        logger.info(f"User input from overlay: {text[:60]}")
-        _dispatch_llm_async(text, trigger_type="user_input")
+        """User typed a message or dropped files — dispatch async LLM."""
+        logger.info(f"User input from overlay: {text[:80]}")
+        # Parse file drop prefix
+        if text.startswith("[DROPPED FILES]"):
+            # Send to LLM with context about the dropped files
+            _dispatch_llm_async(
+                f"The user dropped the following files on you. Acknowledge them and offer to help:\n{text}",
+                trigger_type="user_input",
+            )
+        else:
+            _dispatch_llm_async(text, trigger_type="user_input")
 
     overlay.user_message_submitted.connect(_on_user_message)
 
@@ -277,7 +279,6 @@ def main() -> None:
             "GGUF Models (*.gguf);;All Files (*)",
         )
         if path:
-            # Save to .env
             env_path = Path(__file__).parent.parent / ".env"
             lines = env_path.read_text().splitlines() if env_path.exists() else []
             found = False

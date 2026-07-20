@@ -5,11 +5,15 @@ a threading.Lock(). Widget mutations only happen on the main Qt thread
 via Signal/slot dispatch.
 
 Features:
+- True transparency via WA_TranslucentBackground + CompositionMode_Source
+  (no X11 mask — eliminates the opaque blue box)
 - Click-through mode for non-interactive states
-- Working close button (bottom-right corner)
+- Smooth hover popup chat window (appears on mouse enter, disappears on leave)
 - Drag-to-move (suppresses autonomy spam during drag)
 - Sprite-based frame animation with PNG sprites
-- Idle wandering via QPropertyAnimation
+- Idle wandering via QPropertyAnimation with smooth easing
+- Stillness rule: ALL movement stops when mouse is over the character
+- Centered launch (no top-left snap)
 """
 
 import logging
@@ -18,13 +22,14 @@ import threading
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
-from PySide6.QtWidgets import QWidget, QApplication, QLabel, QLineEdit
+from PySide6.QtWidgets import QWidget, QApplication, QLabel, QLineEdit, QTextEdit, QFrame
 from PySide6.QtCore import (
     Qt, QPoint, QTimer, QSize, Signal, QPropertyAnimation,
-    QEasingCurve, QRect,
+    QEasingCurve, QRect, QParallelAnimationGroup, QPropertyAnimation,
 )
 from PySide6.QtGui import (
     QPainter, QColor, QPen, QBrush, QCursor, QPixmap, QFont,
+    QPainterPath, QFontMetrics,
 )
 
 from src.brain.decisions import Decision, DecisionType
@@ -142,12 +147,292 @@ class SpriteManager:
         return None
 
 
+# ── Hover Chat Popup ──────────────────────────────────────────────
+
+class HoverChatPopup(QFrame):
+    """
+    Smooth pop-out chat window that appears when hovering over the character.
+
+    Features:
+    - Slides in from below with opacity fade
+    - Contains a read-only chat display and a text input
+    - Supports drag-and-drop files
+    - Auto-hides when mouse leaves the character area
+    """
+
+    message_submitted = Signal(str)
+    files_dropped = Signal(list)
+
+    POPUP_WIDTH = 320
+    POPUP_HEIGHT = 180
+    POPUP_MARGIN = 8
+
+    def __init__(self, parent: Optional[QWidget] = None) -> None:
+        super().__init__(parent)
+        self.setWindowFlags(Qt.WindowType.FramelessWindowHint | Qt.WindowType.Tool)
+        self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
+
+        self._visible = False
+        self._animating = False
+        self._slide_anim: Optional[QPropertyAnimation] = None
+        self._opacity_anim: Optional[QPropertyAnimation] = None
+        self._opacity = 0.0
+        self._slide_offset = 0  # 0 = fully visible, positive = hidden below
+
+        self._setup_ui()
+        self.setAcceptDrops(True)
+        self.setVisible(False)
+
+    def _setup_ui(self) -> None:
+        self.setFixedSize(self.POPUP_WIDTH, self.POPUP_HEIGHT)
+
+        # Container with rounded corners and semi-transparent dark bg
+        self.setStyleSheet("""
+            HoverChatPopup {
+                background: rgba(15, 15, 25, 200);
+                border: 1px solid rgba(100, 180, 220, 100);
+                border-radius: 12px;
+            }
+        """)
+
+        layout_rect = QRect(8, 8, self.POPUP_WIDTH - 16, self.POPUP_HEIGHT - 16)
+
+        # Chat display (read-only, shows recent messages)
+        self._chat_display = QTextEdit(self)
+        self._chat_display.setReadOnly(True)
+        self._chat_display.setGeometry(
+            layout_rect.left(), layout_rect.top(),
+            layout_rect.width(), layout_rect.height() - 44,
+        )
+        self._chat_display.setStyleSheet("""
+            QTextEdit {
+                background: transparent;
+                color: rgba(220, 220, 240, 200);
+                font-size: 12px;
+                border: none;
+                padding: 4px;
+            }
+            QTextEdit:focus { border: none; }
+        """)
+        self._chat_display.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+
+        # Input bar at bottom
+        self._input_bar = QLineEdit(self)
+        self._input_bar.setPlaceholderText("Chat with Bubby...")
+        self._input_bar.setGeometry(
+            layout_rect.left(), layout_rect.bottom() - 36,
+            layout_rect.width(), 32,
+        )
+        self._input_bar.setStyleSheet("""
+            QLineEdit {
+                background: rgba(30, 30, 45, 180);
+                color: rgba(255, 255, 255, 230);
+                border: 1px solid rgba(100, 180, 220, 80);
+                border-radius: 6px;
+                padding: 4px 10px;
+                font-size: 12px;
+            }
+            QLineEdit:focus {
+                border: 1px solid rgba(100, 180, 220, 180);
+                background: rgba(40, 40, 60, 200);
+            }
+        """)
+        self._input_bar.returnPressed.connect(self._on_input_submitted)
+
+    def _on_input_submitted(self) -> None:
+        text = self._input_bar.text().strip()
+        if text:
+            self.message_submitted.emit(text)
+            # Show what the user typed
+            self._append_chat(f"<span style='color:#8ab4f8;'>You:</span> {text}")
+        self._input_bar.clear()
+
+    def _append_chat(self, html: str) -> None:
+        self._chat_display.append(html)
+        # Auto-scroll to bottom
+        scrollbar = self._chat_display.verticalScrollBar()
+        if scrollbar:
+            scrollbar.setValue(scrollbar.maximum())
+
+    def append_message(self, sender: str, message: str) -> None:
+        """Add a message to the chat display."""
+        color = "#f0c060" if sender == "Bubby" else "#8ab4f8"
+        self._append_chat(f"<span style='color:{color};'>{sender}:</span> {message}")
+
+    def show_popup(self, anchor_rect: QRect) -> None:
+        """
+        Show the popup above the anchor with a slide-up + fade-in animation.
+        """
+        if self._visible and not self._animating:
+            return
+
+        # Position popup centered above the anchor (character window)
+        popup_x = anchor_rect.center().x() - self.POPUP_WIDTH // 2
+        popup_y = anchor_rect.top() - self.POPUP_HEIGHT - self.POPUP_MARGIN
+
+        # Ensure the popup stays on screen
+        screen = QApplication.primaryScreen()
+        if screen:
+            sg = screen.availableGeometry()
+            popup_x = max(sg.left() + 10, min(popup_x, sg.right() - self.POPUP_WIDTH - 10))
+            if popup_y < sg.top() + 10:
+                # Show below instead if no room above
+                popup_y = anchor_rect.bottom() + self.POPUP_MARGIN
+
+        self.move(popup_x, popup_y)
+        self.setVisible(True)
+        self.raise_()
+        self._input_bar.setFocus()
+
+        self._visible = True
+        self._animate_in()
+
+    def _animate_in(self) -> None:
+        """Slide up + fade in animation."""
+        self._animating = True
+        self._slide_offset = 40  # Start 40px below final position
+
+        # Opacity animation
+        self._opacity_anim = QPropertyAnimation(self, b"opacity")
+        self._opacity_anim.setDuration(200)
+        self._opacity_anim.setStartValue(0.0)
+        self._opacity_anim.setEndValue(1.0)
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.OutCubic)
+        self._opacity_anim.finished.connect(self._on_anim_done)
+
+        # Slide animation - we use the window position for slide effect
+        original_pos = self.pos()
+        start_pos = QPoint(original_pos.x(), original_pos.y() + self._slide_offset)
+        self._slide_anim = QPropertyAnimation(self, b"pos")
+        self._slide_anim.setDuration(250)
+        self._slide_anim.setStartValue(start_pos)
+        self._slide_anim.setEndValue(original_pos)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.OutBack)
+
+        self._opacity_anim.start()
+        self._slide_anim.start()
+
+    def _animate_out(self) -> None:
+        """Fade out + slide down animation."""
+        self._animating = True
+
+        self._opacity_anim = QPropertyAnimation(self, b"opacity")
+        self._opacity_anim.setDuration(150)
+        self._opacity_anim.setStartValue(1.0)
+        self._opacity_anim.setEndValue(0.0)
+        self._opacity_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+        self._opacity_anim.finished.connect(self._on_anim_done)
+
+        original_pos = self.pos()
+        end_pos = QPoint(original_pos.x(), original_pos.y() + 30)
+        self._slide_anim = QPropertyAnimation(self, b"pos")
+        self._slide_anim.setDuration(150)
+        self._slide_anim.setStartValue(original_pos)
+        self._slide_anim.setEndValue(end_pos)
+        self._slide_anim.setEasingCurve(QEasingCurve.Type.InCubic)
+
+        self._opacity_anim.start()
+        self._slide_anim.start()
+
+    def hide_popup(self) -> None:
+        if not self._visible:
+            return
+        self._visible = False
+        self._animate_out()
+
+    def _on_anim_done(self) -> None:
+        self._animating = False
+        if not self._visible:
+            self.setVisible(False)
+
+    def get_opacity(self) -> float:
+        return self._opacity
+
+    def set_opacity(self, val: float) -> None:
+        self._opacity = val
+        self.setWindowOpacity(val)
+        self.update()
+
+    opacity = property(get_opacity, set_opacity)
+
+    def dragEnterEvent(self, event) -> None:
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+            self.setStyleSheet("""
+                HoverChatPopup {
+                    background: rgba(30, 60, 80, 220);
+                    border: 2px solid rgba(100, 200, 255, 180);
+                    border-radius: 12px;
+                }
+            """)
+
+    def dragLeaveEvent(self, event) -> None:
+        self.setStyleSheet("""
+            HoverChatPopup {
+                background: rgba(15, 15, 25, 200);
+                border: 1px solid rgba(100, 180, 220, 100);
+                border-radius: 12px;
+            }
+        """)
+
+    def dropEvent(self, event) -> None:
+        self.setStyleSheet("""
+            HoverChatPopup {
+                background: rgba(15, 15, 25, 200);
+                border: 1px solid rgba(100, 180, 220, 100);
+                border-radius: 12px;
+            }
+        """)
+        if event.mimeData().hasUrls():
+            urls = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+            if urls:
+                self.files_dropped.emit(urls)
+                self._append_chat(f"<span style='color:#aaa;'>📎 Dropped {len(urls)} file(s)</span>")
+                event.acceptProposedAction()
+
+    def paintEvent(self, event) -> None:
+        """Custom paint for rounded corners with the semi-transparent bg."""
+        p = QPainter(self)
+        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+
+        # Clip to rounded rect
+        path = QPainterPath()
+        path.addRoundedRect(self.rect().adjusted(0, 0, 0, 0), 12, 12)
+        p.setClipPath(path)
+
+        # Background
+        p.fillRect(self.rect(), QColor(15, 15, 25, 200))
+
+        # Border
+        pen = QPen(QColor(100, 180, 220, 100), 1)
+        pen.setCosmetic(True)
+        p.setPen(pen)
+        p.drawRoundedRect(self.rect().adjusted(0, 0, -1, -1), 12, 12)
+        p.end()
+
+        # Let child widgets paint
+        super().paintEvent(event)
+
+    def closeEvent(self, event) -> None:
+        self._visible = False
+        self._animating = False
+        super().closeEvent(event)
+
+
 # ── Overlay Window ────────────────────────────────────────────────
 
 class OverlayWindow(QWidget):
     """
     Frameless, transparent, always-on-top overlay window with
-    sprite animation, close button, dragging, and idle wandering.
+    sprite animation, close button, dragging, idle wandering,
+    still-on-hover behavior, and a smooth popup chat window.
+
+    True transparency is achieved via:
+      - WA_TranslucentBackground + WA_NoSystemBackground
+      - paintEvent uses CompositionMode_Source to clear before drawing
+      - NO X11 mask (setMask) — eliminates the opaque blue box
     """
 
     # ── Signals ──
@@ -158,13 +443,9 @@ class OverlayWindow(QWidget):
     display_message_signal = Signal(str, str, str)
     update_state_signal = Signal(str, str)
     behavior_state_signal = Signal(object)
-    # Signal emitted while dragging (so autonomy loop can suppress)
     dragging_changed = Signal(bool)
-    # Emitted when user clicks the character body (not close button)
     user_poked = Signal()
-    # Emitted when user types a message and presses Enter in the input box
     user_message_submitted = Signal(str)
-    # Emitted when user clicks the settings (gear) button
     settings_requested = Signal()
 
     CLOSE_ZONE_SIZE = 24
@@ -172,8 +453,8 @@ class OverlayWindow(QWidget):
     CLOSE_ZONE_HOVER_COLOR = QColor(255, 80, 60, 220)
 
     # Wandering
-    WANDER_INTERVAL_MS = 12_000  # Wander every 12 seconds when idle
-    WANDER_DURATION_MS = 3_000   # Movement takes exactly 3 seconds
+    WANDER_INTERVAL_MS = 12_000    # Wander every 12 seconds when idle
+    WANDER_DURATION_MS = 3_000     # Movement takes 3 seconds
 
     def __init__(
         self,
@@ -194,6 +475,11 @@ class OverlayWindow(QWidget):
         self._current_tint: Optional[QColor] = None
         self._state_lock = threading.Lock()
 
+        # Hover state
+        self._mouse_over_character = False
+        self._hover_timer: Optional[QTimer] = None
+        self._hover_popup: Optional[HoverChatPopup] = None
+
         # Sprite animation
         self._sprite_manager = SpriteManager()
         self._sprite_timer = QTimer(self)
@@ -210,13 +496,32 @@ class OverlayWindow(QWidget):
         self._wander_timer.start(self.WANDER_INTERVAL_MS)
 
         self._setup_window()
-        self._setup_input_box()
+        self._setup_hover_popup()
         self._setup_settings_button()
         self._setup_close_zone_timer()
 
         # Start default animation
         self.set_state("idle")
+
+        # SPRINT 4: Peekaboo timer — check every 2s for overlapping windows
+        self._peekaboo_timer = QTimer(self)
+        self._peekaboo_timer.timeout.connect(self._update_peekaboo)
+        self._peekaboo_timer.start(2000)
+
+        # Launch at center of screen (no top-left snap)
+        QTimer.singleShot(50, self._center_on_screen)
+
         logger.info(f"OverlayWindow initialized: {size}")
+
+    def _center_on_screen(self) -> None:
+        """Move window to center of primary screen on launch."""
+        screen = QApplication.primaryScreen()
+        if screen:
+            sg = screen.availableGeometry()
+            cx = sg.center().x() - self._window_size[0] // 2
+            cy = sg.center().y() - self._window_size[1] // 2
+            self.move(cx, cy)
+            logger.info(f"Centered on screen: ({cx}, {cy})")
 
     # ── Window setup ──────────────────────────────────────────────
 
@@ -226,12 +531,27 @@ class OverlayWindow(QWidget):
             | Qt.WindowType.WindowStaysOnTopHint
             | Qt.WindowType.Tool
         )
+        # True transparency — no X11 mask needed
         self.setAttribute(Qt.WidgetAttribute.WA_TranslucentBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_NoSystemBackground)
         self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose)
+        self.setAttribute(Qt.WidgetAttribute.WA_ShowWithoutActivating)
         self.set_click_through(self._click_through)
         self.setFixedSize(*self._window_size)
         self.setMouseTracking(True)
+        self.setAcceptDrops(True)
+
+    def _setup_hover_popup(self) -> None:
+        """Create the hover chat popup window (hidden by default)."""
+        self._hover_popup = HoverChatPopup()
+        self._hover_popup.message_submitted.connect(self._on_popup_input)
+        self._hover_popup.files_dropped.connect(self._on_files_dropped)
+
+        # Timer to detect hover for popup show
+        self._hover_timer = QTimer(self)
+        self._hover_timer.setSingleShot(True)
+        self._hover_timer.setInterval(600)  # 600ms hover delay before showing popup
+        self._hover_timer.timeout.connect(self._show_hover_popup)
 
     def _setup_settings_button(self) -> None:
         """Add a small gear icon button for settings."""
@@ -250,48 +570,40 @@ class OverlayWindow(QWidget):
             }
         """)
         self._settings_btn.setFixedSize(24, 24)
-        # Position next to the close zone (bottom-right corner, left of close)
         w, h = self._window_size
         self._settings_btn.move(w - self.CLOSE_ZONE_SIZE - 28, h - self.CLOSE_ZONE_SIZE - 2)
         self._settings_btn.mousePressEvent = lambda e: self.settings_requested.emit()
         self._settings_btn.show()
 
-    def _setup_input_box(self) -> None:
-        """Create a text input box for chatting with Bubby."""
-        w, h = self._window_size
-        input_height = 32
-        self._input_box = QLineEdit(self)
-        self._input_box.setPlaceholderText("Chat with Bubby...")
-        self._input_box.setGeometry(8, h - input_height - 8, w - 16, input_height)
-        self._input_box.setStyleSheet("""
-            QLineEdit {
-                background: rgba(20, 20, 30, 180);
-                color: rgba(255, 255, 255, 230);
-                border: 1px solid rgba(100, 180, 220, 120);
-                border-radius: 6px;
-                padding: 4px 10px;
-                font-size: 12px;
-            }
-            QLineEdit:focus {
-                border: 1px solid rgba(100, 180, 220, 200);
-            }
-        """)
-        self._input_box.returnPressed.connect(self._on_input_submitted)
-        # Hide by default — user can type to show
-        self._input_box.show()
+    # Removed _setup_input_box — input is now in HoverChatPopup
 
-    def _on_input_submitted(self) -> None:
-        """Handle Enter key in the input box."""
-        text = self._input_box.text().strip()
-        if text:
-            logger.debug(f"User submitted message: {text[:60]}")
-            self.user_message_submitted.emit(text)
-        self._input_box.clear()
+    def _on_popup_input(self, text: str) -> None:
+        """Handle Enter key in the hover popup input bar."""
+        logger.debug(f"User submitted message from popup: {text[:60]}")
+        # Echo user message in popup
+        if self._hover_popup:
+            self._hover_popup.append_message("You", text)
+        self.user_message_submitted.emit(text)
 
-    def set_input_visible(self, visible: bool) -> None:
-        """Show or hide the text input box."""
-        if hasattr(self, '_input_box'):
-            self._input_box.setVisible(visible)
+    def _on_files_dropped(self, paths: list) -> None:
+        """Handle files dropped on the hover popup."""
+        logger.info(f"Files dropped on hover popup: {paths}")
+        # Emit as a special user message
+        file_list = "\n".join(paths)
+        self.user_message_submitted.emit(f"[DROPPED FILES]\n{file_list}")
+
+    def _show_hover_popup(self) -> None:
+        """Show the hover chat popup above the character."""
+        if self._hover_popup and self._mouse_over_character and not self._is_dragging:
+            # Only show if mouse is still over character
+            global_pos = self.mapToGlobal(QPoint(0, 0))
+            anchor = QRect(global_pos, self.size())
+            self._hover_popup.show_popup(anchor)
+
+    def _hide_hover_popup(self) -> None:
+        """Hide the hover chat popup."""
+        if self._hover_popup:
+            self._hover_popup.hide_popup()
 
     def _setup_close_zone_timer(self) -> None:
         self._close_zone_timer = QTimer(self)
@@ -306,7 +618,7 @@ class OverlayWindow(QWidget):
 
         Args:
             state_name: One of 'idle', 'wave', 'talk', 'observe',
-                        'think', 'confused', 'curious', 'success'.
+                        'think', 'confused', 'curious', 'success', etc.
             message_text: Optional message to display.
         """
         self._current_anim_name = state_name
@@ -331,6 +643,16 @@ class OverlayWindow(QWidget):
             "observe": "\U0001F440", "think": "\U0001F914",
             "confused": "\U0001F615", "curious": "\U0001F9D0",
             "success": "\u2705", "frustrated": "\U0001F624",
+            "sleep": "\U0001F634", "excited": "\U0001F929",
+            "sad": "\U0001F622", "surprised": "\U0001F62E",
+            "love": "\U0001F970", "dance": "\U0001F483",
+            "point": "\u261D\uFE0F", "hide": "\U0001F440",
+            "stretch": "\U0001F64C", "blush": "\U0001F60A",
+            "angry": "\U0001F620", "plead": "\U0001F97A",
+            "celebrate": "\U0001F389", "sneeze": "\U0001F927",
+            "yawn": "\U0001F971", "reading": "\U0001F4D6",
+            "nod": "\U0001F44D", "facepalm": "\U0001F926",
+            "victory": "\U0001F3C6",
         }
         emoji = emote_map.get(state_name, "\U0001F600")
         if not self._emoji_label:
@@ -383,6 +705,12 @@ class OverlayWindow(QWidget):
             with self._state_lock:
                 self._current_tint = tint
             self.update()
+
+        # Also push message to hover popup if visible
+        if self._hover_popup:
+            sender = "Bubby"
+            self._hover_popup.append_message(sender, text[:200])
+
         QTimer.singleShot(duration_ms, self._clear_message)
 
     def update_behavior_state(self, decision: Decision) -> None:
@@ -394,14 +722,15 @@ class OverlayWindow(QWidget):
     def is_dragging(self) -> bool:
         return self._is_dragging
 
+    def is_mouse_over(self) -> bool:
+        return self._mouse_over_character
+
     def sizeHint(self) -> QSize:
         return QSize(*self._window_size)
 
     # ── Close button ──────────────────────────────────────────────
 
     def _close_zone_rect(self) -> QRect:
-        """Return the strict 24x24 pixel close button rect in the
-        absolute bottom-right corner of the window."""
         w, h = self.width(), self.height()
         return QRect(
             w - self.CLOSE_ZONE_SIZE,
@@ -429,12 +758,21 @@ class OverlayWindow(QWidget):
             self._current_tint = None
         self.update()
 
-    # ── Idle wandering ────────────────────────────────────────────
+    # ── Idle wandering (with stillness rule) ──────────────────────
 
     def _idle_wander(self) -> None:
-        """Move window to a random position on screen."""
+        """Move window to a random position on screen.
+
+        Stillness Rule: If the mouse cursor is hovering over the character,
+        ALL autonomous movement MUST stop.
+        """
         if self._is_dragging:
             return
+        if self._mouse_over_character:
+            # STILLNESS RULE: No wandering when mouse is over character
+            logger.debug("Stillness rule active — suppressing wander (mouse over character)")
+            return
+
         bounds = self._get_safe_bounds()
         if bounds.width() <= 0 or bounds.height() <= 0:
             return
@@ -445,7 +783,6 @@ class OverlayWindow(QWidget):
             return
 
         logger.debug(f"Idle wander to ({tx}, {ty})")
-        # Keep a reference so the animation isn't garbage-collected
         self._wander_anim = QPropertyAnimation(self, b"pos")
         self._wander_anim.setDuration(self.WANDER_DURATION_MS)
         self._wander_anim.setStartValue(self.pos())
@@ -456,6 +793,10 @@ class OverlayWindow(QWidget):
     def wander_to(self, target: QPoint) -> None:
         """Move window to a specific target position."""
         if self._is_dragging:
+            return
+        if self._mouse_over_character:
+            # Stillness rule applies to forced wander too
+            logger.debug("Stillness rule active — suppressing forced wander")
             return
         if target == self.pos():
             return
@@ -520,15 +861,10 @@ class OverlayWindow(QWidget):
     # ── Body click interaction ────────────────────────────────────
 
     def _on_body_click(self) -> None:
-        """Handle a click on the character body (not close button).
-
-        Triggers the 'wave' animation and emits user_poked signal
-        so the LLM can respond. Reverts to idle after 3 seconds.
-        """
+        """Handle a click on the character body (not close button)."""
         logger.debug("Body clicked — triggering wave + poke")
         self.set_state("wave")
         self.user_poked.emit()
-        # Revert to idle after animation plays
         QTimer.singleShot(3000, lambda: self.set_state("idle"))
 
     # ── Sprite animation ──────────────────────────────────────────
@@ -538,91 +874,171 @@ class OverlayWindow(QWidget):
             if not self._current_anim.advance():
                 self._sprite_timer.stop()
         self.update()
-        # Always refresh window mask on every frame
-        self._update_mask()
+        # NO mask update — true transparency via CompositionMode_Source
 
-    def _update_mask(self) -> None:
-        """Apply window mask from sprite alpha channel for true X11 transparency.
+    # ── SPRINT 4: Resizing via scroll wheel ──────────────────────
+    # Shrink down to MIN_SCALE (0.18x), cannot grow larger than 1.0x
+    MIN_SCALE = 0.18
+    MAX_SCALE = 1.0
+    SCALE_STEP = 0.05
 
-        Cuts the window to the shape of the character's visible pixels
-        plus the input box area. Eliminates the blue background box entirely.
+    def _current_scale(self) -> float:
+        """Get current scale factor relative to original size."""
+        return self.width() / self._window_size[0]
+
+    def wheelEvent(self, event) -> None:
+        """Handle scroll wheel for resizing the character.
+
+        Ctrl+Scroll UP = grow (up to MAX_SCALE)
+        Ctrl+Scroll DOWN = shrink (down to MIN_SCALE)
+        Cannot grow larger than the default size (MAX_SCALE = 1.0).
         """
-        from PySide6.QtGui import QBitmap
-        w, h = self.width(), self.height()
-        if w <= 0 or h <= 0:
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            current_scale = self._current_scale()
+            delta = event.angleDelta().y()
+            if delta > 0:
+                # Scroll up = grow
+                new_scale = min(current_scale + self.SCALE_STEP, self.MAX_SCALE)
+            else:
+                # Scroll down = shrink
+                new_scale = max(current_scale - self.SCALE_STEP, self.MIN_SCALE)
+
+            new_size = int(self._window_size[0] * new_scale)
+            # Keep window square
+            self.setFixedSize(new_size, new_size)
+
+            # Reposition to keep center stable
+            center = self.geometry().center()
+            new_rect = self.geometry()
+            new_rect.setSize(self.size())
+            new_rect.moveCenter(center)
+            self.setGeometry(new_rect)
+
+            logger.debug(f"Resized to {new_scale:.2f}x ({new_size}px)")
+            event.accept()
+        else:
+            super().wheelEvent(event)
+
+    # ── SPRINT 4: Peekaboo — Hide behind open windows ───────────
+    def _check_window_overlap(self) -> bool:
+        """Check if any other window overlaps the character.
+
+        Returns True if the character should hide (peekaboo).
+        """
+        try:
+            from PySide6.QtGui import QWindow
+            from PySide6.QtWidgets import QApplication
+
+            my_geo = self.geometry()
+            my_center = my_geo.center()
+
+            for widget in QApplication.topLevelWidgets():
+                if widget == self or not widget.isVisible() or widget.windowOpacity() < 0.1:
+                    continue
+                # Skip our own popup
+                if hasattr(self, '_hover_popup') and self._hover_popup and widget == self._hover_popup:
+                    continue
+                other_geo = widget.geometry()
+                # Check if other window significantly overlaps the character center
+                overlap = other_geo.intersected(my_geo)
+                if overlap.isValid() and overlap.width() > 40 and overlap.height() > 40:
+                    # Check if we're behind this window (it has focus or is above us)
+                    if widget.isActiveWindow() or widget.windowFlags() & Qt.WindowType.WindowStaysOnTopHint:
+                        return True
+            return False
+        except Exception:
+            return False
+
+    def _update_peekaboo(self) -> None:
+        """Update peekaboo state — hide or show based on window overlap."""
+        if self._mouse_over_character or self._is_dragging:
+            # Don't peekaboo when user is interacting
             return
+        should_hide = self._check_window_overlap()
+        if should_hide:
+            # Reduce opacity to peekaboo level
+            self.setWindowOpacity(0.15)
+            self.set_state("hide")
+        else:
+            # Restore full opacity
+            self.setWindowOpacity(1.0)
+            if self._current_anim_name == "hide":
+                self.set_state("idle")
 
-        # Always clear the old mask before computing new one
-        self.clearMask()
+    # ── SPRINT 3: Physical Guidance ──────────────────────────────
+    def physical_guide_to(self, target_screen_pos: QPoint) -> None:
+        """Move character to point at a specific screen coordinate.
 
-        mask = QBitmap(w, h)
-        mask.fill(Qt.GlobalColor.color0)
+        Used when the user asks "how do I install this" — the character
+        moves to the button coordinates and points at it.
 
-        p = QPainter(mask)
-        p.setRenderHint(QPainter.RenderHint.Antialiasing)
+        Args:
+            target_screen_pos: Screen coordinates to point at
+        """
+        my_center = self.geometry().center()
+        dx = target_screen_pos.x() - my_center.x()
+        dy = target_screen_pos.y() - my_center.y()
 
-        # Include sprite pixels from CURRENT frame
-        if self._current_anim and self._current_anim.playing:
-            pix = self._current_anim.current_pixmap()
-            if pix and not pix.isNull():
-                scaled = pix.scaled(
-                    w, h,
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-                x = (w - scaled.width()) // 2
-                y = (h - scaled.height()) // 2
-                sprite_mask = scaled.createMaskFromColor(
-                    QColor(0, 0, 0, 0), Qt.MaskMode.MaskOutColor
-                )
-                p.drawPixmap(x, y, sprite_mask)
+        # Move to a position where we can point at the target
+        point_x = target_screen_pos.x() - 100  # Stand to the left of target
+        point_y = target_screen_pos.y() - 100  # Stand above the target
+        target_pos = QPoint(point_x, point_y)
 
-        # Always include input box area so user can type
-        if hasattr(self, '_input_box') and self._input_box.isVisible():
-            input_rect = self._input_box.geometry()
-            input_rect = input_rect.adjusted(-2, -2, 2, 4)
-            p.fillRect(input_rect, Qt.GlobalColor.color1)
+        logger.info(f"Physical guidance to ({target_screen_pos.x()}, {target_screen_pos.y()})")
+        self.wander_to(target_pos)
 
-        # Always include state label area
-        if self._state_label and self._state_label.isVisible():
-            label_rect = self._state_label.geometry()
-            label_rect = label_rect.adjusted(-2, -2, 2, 4)
-            p.fillRect(label_rect, Qt.GlobalColor.color1)
+        # Show pointing animation
+        self.set_state("point")
+        QTimer.singleShot(4000, lambda: self.set_state("idle"))
 
-        # Always include close zone
-        if self._close_zone_enabled and not self._click_through:
-            p.fillRect(self._close_zone_rect(), Qt.GlobalColor.color1)
+    # ── SPRINT 4: Synced Animations ──────────────────────────────
+    def start_talk_animation(self, tts_duration_ms: int = 3000) -> None:
+        """Start talk animation synced with TTS output.
 
-        p.end()
-        self.setMask(mask)
+        The talk animation will play for tts_duration_ms then revert
+        to idle. Call this when TTS begins speaking.
+
+        Args:
+            tts_duration_ms: Expected duration of TTS speech
+        """
+        self.set_state("talk")
+        QTimer.singleShot(tts_duration_ms, lambda: self.set_state("idle"))
 
     # ── Qt events ─────────────────────────────────────────────────
 
-    def paintEvent(self, event) -> None:  # noqa: ARG002
-        try:
-            # IMPORTANT: Use CompositionMode_Source to clear the background
-            # before painting. This ensures transparency works on X11/Linux.
-            # The window mask (setMask) cuts the window shape; here we ensure
-            # no background fill is painted.
+    def paintEvent(self, event) -> None:
+        """
+        Paint the character with TRUE transparency.
 
-            # State tint — only draw if explicitly set (event-specific highlight)
+        Uses CompositionMode_Source to ensure the background is fully
+        transparent before drawing the sprite. No window mask needed.
+        """
+        try:
+            p = QPainter(self)
+            p.setRenderHint(QPainter.RenderHint.Antialiasing)
+            p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
+
+            # ── STEP 1: Clear background to transparent ──
+            # CompositionMode_Source replaces the destination pixels entirely,
+            # including alpha. This ensures the window background is 100%
+            # transparent and NO blue box appears.
+            p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
+            p.fillRect(self.rect(), QColor(0, 0, 0, 0))
+
+            # ── STEP 2: Draw state tint (if set) ──
+            # Use SourceOver so tint blends with sprite
             with self._state_lock:
                 tint = self._current_tint
             if tint is not None:
-                p = QPainter(self)
-                p.setRenderHint(QPainter.RenderHint.Antialiasing)
                 p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
                 p.fillRect(self.rect(), tint)
-                p.end()
 
-            # Sprite frame — paint with CompositionMode_Source to clear background
+            # ── STEP 3: Draw sprite frame ──
+            # Use SourceOver so sprite alpha blends correctly over transparent bg
             if self._current_anim and self._current_anim.playing:
                 pix = self._current_anim.current_pixmap()
                 if pix and not pix.isNull():
-                    p = QPainter(self)
-                    p.setRenderHint(QPainter.RenderHint.SmoothPixmapTransform)
-                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_Source)
-                    # Center the sprite in the window, scaled to fit
+                    p.setCompositionMode(QPainter.CompositionMode.CompositionMode_SourceOver)
                     scaled = pix.scaled(
                         self._window_size[0], self._window_size[1],
                         Qt.AspectRatioMode.KeepAspectRatio,
@@ -631,46 +1047,44 @@ class OverlayWindow(QWidget):
                     x = (self._window_size[0] - scaled.width()) // 2
                     y = (self._window_size[1] - scaled.height()) // 2
                     p.drawPixmap(x, y, scaled)
-                    p.end()
 
-            # Close zone indicator (24x24 rounded rect in bottom-right corner)
-            if not self._close_zone_enabled or self._click_through:
-                return
-            w, h = self.width(), self.height()
-            if w <= 0 or h <= 0:
-                return
-            mouse_pos = self.mapFromGlobal(QCursor.pos())
-            hovered = self._is_in_close_zone(mouse_pos)
-            if not hovered:
-                return
-
-            p = QPainter(self)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing)
-            zone_rect = self._close_zone_rect()
-            color = self.CLOSE_ZONE_HOVER_COLOR if hovered else self.CLOSE_ZONE_COLOR
-            p.setPen(Qt.PenStyle.NoPen)
-            p.setBrush(QBrush(color))
-            p.drawRoundedRect(zone_rect, 4, 4)
-            # X icon
-            pen = QPen(QColor(255, 255, 255, 240), 2)
-            pen.setCapStyle(Qt.PenCapStyle.RoundCap)
-            p.setPen(pen)
-            margin = 5
-            x0, y0 = zone_rect.left() + margin, zone_rect.top() + margin
-            x1, y1 = zone_rect.right() - margin, zone_rect.bottom() - margin
-            p.drawLine(x0, y0, x1, y1)
-            p.drawLine(x1, y0, x0, y1)
             p.end()
+
+            # ── Close zone indicator (bottom-right X button) ──
+            if self._close_zone_enabled and not self._click_through:
+                w, h = self.width(), self.height()
+                if w > 0 and h > 0:
+                    mouse_pos = self.mapFromGlobal(QCursor.pos())
+                    hovered = self._is_in_close_zone(mouse_pos)
+                    if hovered:
+                        p2 = QPainter(self)
+                        p2.setRenderHint(QPainter.RenderHint.Antialiasing)
+                        zone_rect = self._close_zone_rect()
+                        color = self.CLOSE_ZONE_HOVER_COLOR if hovered else self.CLOSE_ZONE_COLOR
+                        p2.setPen(Qt.PenStyle.NoPen)
+                        p2.setBrush(QBrush(color))
+                        p2.drawRoundedRect(zone_rect, 4, 4)
+                        # X icon
+                        pen = QPen(QColor(255, 255, 255, 240), 2)
+                        pen.setCapStyle(Qt.PenCapStyle.RoundCap)
+                        p2.setPen(pen)
+                        margin = 5
+                        x0, y0 = zone_rect.left() + margin, zone_rect.top() + margin
+                        x1, y1 = zone_rect.right() - margin, zone_rect.bottom() - margin
+                        p2.drawLine(x0, y0, x1, y1)
+                        p2.drawLine(x1, y0, x0, y1)
+                        p2.end()
+
         except Exception as e:
             logger.debug(f"paintEvent: {e}")
 
     def mousePressEvent(self, event) -> None:
         if event.button() == Qt.MouseButton.LeftButton:
             pos = event.pos()
-            # Do NOT close on press — defer decision to release.
-            # Only start drag tracking on press.
             self._drag_start_pos = pos
             self._is_dragging = False
+            # Hide popup on click
+            self._hide_hover_popup()
         super().mousePressEvent(event)
 
     def mouseMoveEvent(self, event) -> None:
@@ -679,6 +1093,7 @@ class OverlayWindow(QWidget):
                 self._is_dragging = True
                 self.dragging_changed.emit(True)
                 self.drag_started_signal.emit(event.pos())
+                self._hide_hover_popup()
         if self._is_dragging:
             self.move(event.globalPosition().toPoint() - self._drag_start_pos)
         super().mouseMoveEvent(event)
@@ -688,40 +1103,91 @@ class OverlayWindow(QWidget):
             pos = event.pos()
 
             if self._is_dragging:
-                # End of drag — do NOT treat as close or interaction
                 self.drag_finished_signal.emit(pos)
                 self._is_dragging = False
                 self._drag_start_pos = None
                 self.dragging_changed.emit(False)
             else:
-                # No drag occurred — this was a click.
-                # Check close zone FIRST (strict 24x24 bottom-right corner).
                 if self._is_in_close_zone(pos) and self._close_zone_enabled:
                     logger.info("Close button clicked — shutting down")
                     self.close()
                     QApplication.quit()
                 else:
-                    # Click on body — trigger interactive animation
                     self._on_body_click()
         super().mouseReleaseEvent(event)
 
     def enterEvent(self, event) -> None:
+        """Mouse enters the character window."""
+        self._mouse_over_character = True
+
+        # Stillness rule: stop wandering when mouse is over character
+        if hasattr(self, '_wander_anim') and self._wander_anim:
+            try:
+                self._wander_anim.stop()
+            except Exception:
+                pass
+
         if self._click_through:
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, False)
+
+        # Start hover timer for popup (with delay)
+        if self._hover_timer and not self._is_dragging:
+            self._hover_timer.start()
+
         super().enterEvent(event)
 
     def leaveEvent(self, event) -> None:
+        """Mouse leaves the character window."""
+        self._mouse_over_character = False
+
+        # Cancel pending hover popup
+        if self._hover_timer:
+            self._hover_timer.stop()
+
+        # Hide the popup
+        self._hide_hover_popup()
+
         if self._click_through:
             self.setAttribute(Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
         super().leaveEvent(event)
+
+    def dragEnterEvent(self, event) -> None:
+        """Accept drag enter — pass through to popup or handle."""
+        if event.mimeData().hasUrls():
+            event.acceptProposedAction()
+
+    def dropEvent(self, event) -> None:
+        """Handle file drops directly on the character."""
+        if event.mimeData().hasUrls():
+            urls = [u.toLocalFile() for u in event.mimeData().urls() if u.isLocalFile()]
+            if urls:
+                logger.info(f"Files dropped on character: {urls}")
+                self._on_files_dropped(urls)
+                event.acceptProposedAction()
 
     def closeEvent(self, event) -> None:
         logger.info("OverlayWindow closing")
         self._sprite_timer.stop()
         self._wander_timer.stop()
+        if self._hover_popup:
+            self._hover_popup.close()
         if self._animation_widget:
             self._animation_widget.setParent(None)
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        """Handle window resize — reposition settings button and state label."""
+        super().resizeEvent(event)
+        w, h = self.width(), self.height()
+        # Reposition settings button
+        if hasattr(self, '_settings_btn'):
+            self._settings_btn.move(
+                w - self.CLOSE_ZONE_SIZE - 28,
+                h - self.CLOSE_ZONE_SIZE - 2,
+            )
+        # Reposition state label
+        if hasattr(self, '_state_label') and self._state_label:
+            self._state_label.setGeometry(20, h - 60, w - 40, 40)
 
 
 # ── Testing ───────────────────────────────────────────────────────

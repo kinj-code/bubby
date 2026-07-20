@@ -1,10 +1,13 @@
 """Main application entry point for Bubby desktop companion.
 
-Architecture (decoupled, thread-safe via Qt Signal/Slot):
+Uses the shared cognition stack factory (src/brain/factory.py) to ensure
+identical wiring with the headless daemon (run_autonomous.py).
+
+Architecture:
 - AutonomyLoop (QThread) emits decision_made Signal → main thread slot
 - Vision pipeline callbacks → InteractionHandler → overlay signal → main thread
+- LLM async responses marshalled via LLMResponseBridge Signal to main thread
 - Zero direct widget calls from background threads
-- LLM async responses marshalled via Qt Signal to main thread
 """
 
 # ── Faulthandler: produce C/C++ stack trace on segfault ──────────
@@ -37,26 +40,14 @@ from src.ui.overlay import OverlayWindow
 from src.ui.avatar import AvatarWidget, AvatarConfig
 from src.ui.settings_window import SettingsWindow
 from src.brain.decisions import DecisionType, Decision
-from src.brain.behavior_tree import (
-    BehaviorTree, Selector, Sequence, Condition, Action
-)
+from src.brain.factory import build_cognition_stack
 from src.brain.context_manager import ContextManager
 from src.brain.autonomy_loop import AutonomyLoop
-from src.brain.reasoning import ReasoningBridge
-from src.vision.memory_buffer import MemoryBuffer
-from src.vision.pipeline import VisionPipeline
-from src.memory.long_term_memory import LongTermMemory
-from src.persona.config import PersonaConfig, PersonaType
-from src.persona.llm_synthesis import LLMSynthesisEngine, LLMSynthesisConfig
 from src.persona.synthesis import SynthesizedResponse
 from src.interaction.handler import InteractionHandler, InteractionMessage, InteractionEvent
 from src.actions.executor import SystemExecutor
-from src.voice.tts_engine import TTSEngine, TTSConfig
 
 logger = logging.getLogger(__name__)
-
-USE_LLM = os.environ.get("BUBBY_USE_LLM", "1") == "1"
-USE_TTS = os.environ.get("BUBBY_USE_TTS", "0") == "1"
 
 
 # ══ Thread-safe LLM response bridge ══
@@ -69,31 +60,6 @@ class LLMResponseBridge(QObject):
     to the main thread, where UI updates are safe.
     """
     response_ready = Signal(object)  # SynthesizedResponse
-
-
-def create_behavior_tree() -> BehaviorTree:
-    def idle_action(context):
-        return DecisionType.IDLE
-    def wander_action(context):
-        return DecisionType.WANDER
-    def sit_action(context):
-        return DecisionType.SIT
-    def user_present(context):
-        return context.user_present
-    def idle_time_check(context):
-        return context.user_idle_time > 5.0
-
-    idle_sequence = Sequence("Idle Sequence")
-    idle_sequence.add_child(Condition("User Present?", user_present))
-    idle_sequence.add_child(Action("Idle", idle_action))
-    wander_sequence = Sequence("Wander Sequence")
-    wander_sequence.add_child(Condition("Idle > 5s?", idle_time_check))
-    wander_sequence.add_child(Action("Wander", wander_action))
-    root = Selector("Root")
-    root.add_child(idle_sequence)
-    root.add_child(wander_sequence)
-    root.add_child(Action("Sit", sit_action))
-    return BehaviorTree(root)
 
 
 def main() -> None:
@@ -110,26 +76,44 @@ def main() -> None:
     app.setQuitOnLastWindowClosed(True)
 
     overlay = OverlayWindow(size=(400, 400), click_through=False)
-    behavior_tree = create_behavior_tree()
-    context_manager = ContextManager()
 
-    vision_pipeline = VisionPipeline()
-    memory_buffer = MemoryBuffer(max_observations=50, max_tokens=2048)
-    long_term_memory = LongTermMemory()
-    reasoning_bridge = ReasoningBridge(memory_buffer)
+    # ══ Build FULL cognition stack via shared factory ══
+    def display_to_overlay(message: InteractionMessage) -> None:
+        """Display callback — called by InteractionHandler for UI updates."""
+        if not message or not message.text:
+            return
+        animation_map = {
+            InteractionEvent.GREETING: "wave",
+            InteractionEvent.OBSERVATION: "observe",
+            InteractionEvent.RESPONSE: "talk",
+            InteractionEvent.STATUS: "idle",
+            InteractionEvent.ERROR: "confused",
+        }
+        animation = animation_map.get(message.event, "idle")
+        logger.info(f"[UI->Avatar] {message.event.value}: {message.text[:60]}")
+        overlay.display_message_signal.emit(message.text, animation, message.event.value)
+        overlay.update_state_signal.emit(animation, message.text)
 
-    persona = PersonaConfig(persona_type=PersonaType.WITTY_COMPANION)
-    synthesis_config = LLMSynthesisConfig(
-        use_llm=USE_LLM, fallback_to_template=True, min_confidence_for_llm=0.5,
+    def on_action_approval_needed(action_name: str, request) -> None:
+        logger.info(f"ACTION APPROVAL NEEDED: {action_name}")
+        overlay.update_state_signal.emit("think", f"May I {action_name}?")
+
+    stack = build_cognition_stack(
+        display_callback=display_to_overlay,
+        action_callback=on_action_approval_needed,
+        enable_critic=True,
+        enable_vision=True,
     )
-    synthesis_engine = LLMSynthesisEngine(
-        persona=persona, long_term_memory=long_term_memory, config=synthesis_config,
-    )
 
-    tts_config = TTSConfig(use_subprocess=True)
-    tts_engine = TTSEngine(tts_config) if USE_TTS else None
-    system_executor = SystemExecutor()
+    synthesis_engine = stack["synthesis_engine"]
+    interaction_handler = stack["interaction_handler"]
+    autonomy_loop = stack["autonomy_loop"]
+    vision_pipeline = stack["vision_pipeline"]
+    long_term_memory = stack["long_term_memory"]
+    system_executor = stack["system_executor"]
+    context_manager = stack["context_manager"]
 
+    # ── Avatar ──
     avatar_config = AvatarConfig(
         show_emotes=True, show_text=True, emote_size=64, bob_animation=True,
     )
@@ -152,7 +136,6 @@ def main() -> None:
                 animation=getattr(response, 'animation', 'talk'),
                 source="synthesis",
             )
-            # Update overlay and avatar
             overlay.display_message_signal.emit(
                 message.text,
                 message.animation,
@@ -163,37 +146,9 @@ def main() -> None:
         except Exception as e:
             logger.error(f"Failed to dispatch LLM response to UI: {e}")
 
-    # Connect bridge signal to main thread slot
     llm_bridge.response_ready.connect(_on_llm_response)
 
-    # ── THREAD-SAFE UI dispatch ──
-    def display_to_overlay(message: InteractionMessage) -> None:
-        if not message or not message.text:
-            return
-        animation_map = {
-            InteractionEvent.GREETING: "wave",
-            InteractionEvent.OBSERVATION: "observe",
-            InteractionEvent.RESPONSE: "talk",
-            InteractionEvent.STATUS: "idle",
-            InteractionEvent.ERROR: "confused",
-        }
-        animation = animation_map.get(message.event, "idle")
-        logger.info(f"[UI->Avatar] {message.event.value}: {message.text[:60]}")
-        overlay.display_message_signal.emit(message.text, animation, message.event.value)
-        overlay.update_state_signal.emit(animation, message.text)
-
-    def on_action_approval_needed(action_name: str, request) -> None:
-        logger.info(f"ACTION APPROVAL NEEDED: {action_name}")
-        overlay.update_state_signal.emit("think", f"May I {action_name}?")
-
-    interaction_handler = InteractionHandler(
-        synthesis_engine=synthesis_engine,
-        display_callback=display_to_overlay,
-        tts_engine=tts_engine,
-        action_executor=system_executor,
-        action_callback=on_action_approval_needed,
-    )
-
+    # ── Signal wiring ──
     def _on_display_message(text, animation, event_type):
         overlay.show_message(text=text, animation=animation, event_type=event_type)
 
@@ -209,8 +164,10 @@ def main() -> None:
     import threading as _threading
 
     def _dispatch_llm_async(context_text: str, trigger_type: str = "user_input") -> None:
-        """Run LLM synthesis in a background daemon thread, emit via bridge signal."""
+        """Run LLM synthesis in a background daemon thread, emit via bridge signal.
 
+        ══ FIX: Rigorous try/except with exact exception logging ══
+        """
         # Get template response immediately (instant)
         try:
             template = synthesis_engine._template_engine.synthesize(
@@ -218,17 +175,23 @@ def main() -> None:
                 context_text=context_text,
                 trigger_type=trigger_type,
             )
+            logger.info(f"Template response ready: {template.text[:40] if template else 'None'}")
         except Exception as e:
-            logger.warning(f"Template synthesis failed: {e}")
+            logger.warning(f"Template synthesis failed: {e}", exc_info=True)
             template = None
 
         def _bg_task():
             try:
-                # If synthesis engine has generate_async, use it
                 if hasattr(synthesis_engine, 'generate_async') and template:
+                    logger.info("LLM inference starting...")
+
                     def _on_result(response):
-                        # This callback runs on bg thread — emit signal
+                        elapsed = getattr(_on_result, '_elapsed', 0)
+                        logger.info(f"LLM inference complete in {elapsed}ms")
                         llm_bridge.response_ready.emit(response)
+
+                    import time as _time
+                    _start = _time.time()
 
                     synthesis_engine.generate_async(
                         reasoning=None,
@@ -237,19 +200,20 @@ def main() -> None:
                         trigger_type=trigger_type,
                         callback=_on_result,
                     )
+                    _elapsed = int((_time.time() - _start) * 1000)
+                    _on_result._elapsed = _elapsed
                 elif template:
-                    # Direct response via bridge
+                    logger.info("No generate_async — using template response directly")
                     llm_bridge.response_ready.emit(template)
                 else:
-                    # Emergency fallback
+                    logger.warning("No template available — sending emergency fallback")
                     fallback = SynthesizedResponse(
                         text="Hey! I'm here. What's up? 😊",
                         animation="wave",
                     )
                     llm_bridge.response_ready.emit(fallback)
             except Exception as e:
-                logger.error(f"LLM dispatch error: {e}", exc_info=True)
-                # Emergency fallback on error
+                logger.error(f"LLM dispatch CRASHED: {e}", exc_info=True)
                 fallback = SynthesizedResponse(
                     text="Sorry, I hit a snag. Try again?",
                     animation="confused",
@@ -269,24 +233,35 @@ def main() -> None:
     overlay.user_poked.connect(_on_user_poked)
 
     def _on_user_message(text: str) -> None:
-        """User typed a message or dropped files — dispatch async LLM."""
+        """User typed a message or dropped files — dispatch async LLM.
+
+        ══ FIX: Route drag & drop through InteractionHandler ══
+        """
         logger.info(f"User input from overlay: {text[:80]}")
 
         if text.startswith("[DROPPED FILES]"):
-            # Extract file paths from the message
             file_part = text.replace("[DROPPED FILES]\n", "").strip()
             file_paths = [p.strip() for p in file_part.split("\n") if p.strip()]
-            file_summary = "\n".join(file_paths[:5])  # Limit to 5 files
+            file_summary = "\n".join(file_paths[:5])
             file_count = len(file_paths)
 
-            # ══ FIX: Route through interaction_handler for proper LLM processing ══
+            # ══ Route through InteractionHandler for proper LLM processing ══
             context = (
                 f"The user dropped {file_count} file(s) on you. "
                 f"Files:\n{file_summary}\n\n"
                 f"Acknowledge the files briefly and offer to help with them. "
                 f"Keep your response to 1-2 sentences."
             )
-            # Also show in chat
+            # Also route through handler for proper state management
+            try:
+                handler_msg = interaction_handler.on_user_input(
+                    f"I dropped these files on you: {file_summary}"
+                )
+                if handler_msg and handler_msg.text:
+                    logger.info(f"[Handler] {handler_msg.text[:60]}")
+            except Exception as e:
+                logger.error(f"Handler routing failed: {e}")
+
             _dispatch_llm_async(context, trigger_type="user_input")
         else:
             _dispatch_llm_async(text, trigger_type="user_input")
@@ -299,10 +274,7 @@ def main() -> None:
         dlg.exec()
     overlay.settings_requested.connect(_open_settings)
 
-    autonomy_loop = AutonomyLoop(
-        behavior_tree=behavior_tree, context_manager=context_manager, decision_interval=2.0,
-    )
-
+    # ── Autonomy decision wiring ──
     def on_decision(decision: Decision) -> None:
         logger.debug(f"Decision received: {decision}")
         overlay.behavior_state_signal.emit(decision)
@@ -367,19 +339,22 @@ def main() -> None:
         else:
             logger.info("User skipped model selection — template mode only")
 
-    vision_pipeline.start(capture_interval=5.0)
-    logger.info("Vision pipeline started")
+    # ── Start subsystems ──
+    if vision_pipeline:
+        vision_pipeline.start(capture_interval=5.0)
+        logger.info("Vision pipeline started")
     autonomy_loop.start()
     logger.info("Autonomy loop started")
     interaction_handler.on_greeting(context="startup")
 
     def cleanup():
         logger.info("Shutting down...")
-        vision_pipeline.stop()
+        if vision_pipeline:
+            vision_pipeline.stop()
         autonomy_loop.stop()
         synthesis_engine.shutdown()
-        if tts_engine:
-            tts_engine.shutdown()
+        if stack.get("tts_engine"):
+            stack["tts_engine"].shutdown()
         long_term_memory.clear()
         logger.info("Cleanup complete")
 

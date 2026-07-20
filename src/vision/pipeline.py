@@ -207,10 +207,31 @@ class VisionPipeline:
     
     # Callback for vision observations
     def start(self, capture_interval: float = 5.0) -> None:
-        """Initialize vision processing (no-op: pipeline is stateless)."""
+        """Initialize vision processing (no-op: pipeline is stateless).
+
+        ══ FIX: Log explicit capture diagnostics ══
+        """
         self._running = True
         self._capture_interval = capture_interval
         logger.info(f"Vision pipeline active (interval={capture_interval:.1f}s)")
+
+        # Log capture environment diagnostics
+        try:
+            import os as _os
+            plat = _os.environ.get("QT_QPA_PLATFORM", "not set")
+            logger.info(f"Vision frame capture check — X11/Wayland: QT_QPA_PLATFORM={plat}")
+
+            from PySide6.QtGui import QGuiApplication
+            screens = QGuiApplication.screens()
+            if screens:
+                for i, s in enumerate(screens):
+                    logger.info(f"Vision screen {i}: {s.size().width()}x{s.size().height()}, "
+                                f"depth={s.depth()}")
+            else:
+                logger.warning("⚠️ No screens detected — vision capture will return empty. "
+                               "GUI may be headless or offscreen.")
+        except Exception as e:
+            logger.warning(f"Vision capture diagnostic warning: {e}")
 
     def stop(self) -> None:
         """Stop vision processing."""
